@@ -89,6 +89,16 @@ public:
 		const FString&        GraphName = TEXT("EventGraph"),
 		const FExportOptions& Options   = FExportOptions());
 
+	/**
+	 * Export a specific UEdGraph directly (e.g. AnimationTransitionGraph).
+	 * Use this when the graph is not reachable via Blueprint->FunctionGraphs/UbergraphPages.
+	 * @param Graph         The graph to export
+	 * @param Options       Export options
+	 */
+	static FBlueprintLispResult ExportGraph(
+		UEdGraph*             Graph,
+		const FExportOptions& Options = FExportOptions());
+
 	/** Export a Blueprint loaded from the given asset path */
 	static FBlueprintLispResult ExportByPath(
 		const FString&        BlueprintPath,
@@ -116,6 +126,19 @@ public:
 	static FBlueprintLispResult Import(
 		UBlueprint*           Blueprint,
 		const FString&        GraphName,
+		const FString&        LispCode,
+		const FImportOptions& Options = FImportOptions());
+
+	/**
+	 * Import BlueprintLisp DSL into a specific UEdGraph directly.
+	 * Use this for graphs not reachable via Blueprint->FunctionGraphs/UbergraphPages
+	 * (e.g. AnimationTransitionGraph).
+	 * @param Graph         The target graph to write nodes into
+	 * @param LispCode      DSL source code
+	 * @param Options       Import options
+	 */
+	static FBlueprintLispResult ImportGraph(
+		UEdGraph*             Graph,
 		const FString&        LispCode,
 		const FImportOptions& Options = FImportOptions());
 

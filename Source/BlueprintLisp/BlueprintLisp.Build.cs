@@ -31,6 +31,8 @@ public class BlueprintLisp : ModuleRules
 			"EditorFramework",
 			"AssetRegistry",
 			"AssetTools",
+			// AnimGraph: for AnimationTransitionGraph and AnimGraphNode_TransitionResult
+			"AnimGraph",
 		});
 	}
 }

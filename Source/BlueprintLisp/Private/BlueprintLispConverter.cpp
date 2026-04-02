@@ -41,9 +41,15 @@
 #include "K2Node_MakeArray.h"
 #include "K2Node_GetArrayItem.h"
 #include "K2Node_FunctionTerminator.h"
+#include "K2Node_EnumEquality.h"
+#include "K2Node_EnumInequality.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
 #include "AssetRegistry/AssetRegistryModule.h"
+#include "UObject/UObjectIterator.h"
+
+#include "AnimGraphNode_TransitionResult.h"
+#include "AnimationTransitionGraph.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintLisp, Log, All);
 
@@ -96,6 +102,8 @@ static TMap<FGuid, FString> ComputeShortIds(const TArray<FGuid>& Guids)
 static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited);
 static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds);
 static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds);
+// ImportGraph helper (defined below after ExportGraph helpers)
+static UEdGraphPin* BuildPureExprNode(const FLispNodePtr& Expr, UEdGraph* Graph, UBlueprint* BP, TArray<UEdGraphNode*>& CreatedNodes, FString& OutLiteralValue);
 
 /** Append :id keyword to a form if the node has a stable GUID in ShortIds */
 static FLispNodePtr AppendNodeId(FLispNodePtr Form, UEdGraphNode* Node, const TMap<FGuid, FString>& ShortIds)
@@ -206,24 +214,50 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 	if (Cast<UK2Node_Self>(SourceNode))
 		return FLispNode::MakeSymbol(TEXT("self"));
 
-	// Literal function call (pure node)
+	// Literal function call (pure node or any call node providing a value)
 	if (UK2Node_CallFunction* CallNode = Cast<UK2Node_CallFunction>(SourceNode))
 	{
-		if (CallNode->IsNodePure())
+		if (Visited.Contains(SourceNode)) return FLispNode::MakeSymbol(TEXT("...circular..."));
+		Visited.Add(SourceNode);
+
+		FString FuncName = GetCleanNodeName(SourceNode);
+		TArray<FLispNodePtr> Args;
+		Args.Add(FLispNode::MakeSymbol(FuncName));
+
+		// Target object
+		UEdGraphPin* SelfPin = SourceNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
+		if (SelfPin && SelfPin->LinkedTo.Num() > 0)
+			Args.Add(ConvertPureExpressionToLisp(SelfPin, Graph, Visited));
+
+		// Input data pins
+		for (UEdGraphPin* Pin : SourceNode->Pins)
+		{
+			if (Pin->Direction != EGPD_Input) continue;
+			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+			if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+			Args.Add(ConvertPureExpressionToLisp(Pin, Graph, Visited));
+		}
+		Visited.Remove(SourceNode);
+		return FLispNode::MakeList(Args);
+	}
+
+	// Generic K2Node pure node (e.g. UK2Node_EnumEquality, UK2Node_EnumInequality, etc.)
+	// These derive from UK2Node but not UK2Node_CallFunction, yet they are pure and output values.
+	if (UK2Node* K2Node = Cast<UK2Node>(SourceNode))
+	{
+		if (K2Node->IsNodePure())
 		{
 			if (Visited.Contains(SourceNode)) return FLispNode::MakeSymbol(TEXT("...circular..."));
 			Visited.Add(SourceNode);
 
-			FString FuncName = GetCleanNodeName(SourceNode);
+			// Use compact node title (e.g. "!=" for EnumInequality) if available, else class name
+			FString NodeName = K2Node->GetCompactNodeTitle().ToString();
+			if (NodeName.IsEmpty())
+				NodeName = SourceNode->GetClass()->GetName();
+
 			TArray<FLispNodePtr> Args;
-			Args.Add(FLispNode::MakeSymbol(FuncName));
+			Args.Add(FLispNode::MakeSymbol(NodeName));
 
-			// Target object
-			UEdGraphPin* SelfPin = SourceNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
-			if (SelfPin && SelfPin->LinkedTo.Num() > 0)
-				Args.Add(ConvertPureExpressionToLisp(SelfPin, Graph, Visited));
-
-			// Input data pins
 			for (UEdGraphPin* Pin : SourceNode->Pins)
 			{
 				if (Pin->Direction != EGPD_Input) continue;
@@ -236,8 +270,11 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		}
 	}
 
-	// Default: return variable name or "?"
-	return FLispNode::MakeSymbol(TEXT("?"));
+	// Fallback for non-pure nodes: return node class name as opaque symbol
+	{
+		FString ClassName = SourceNode->GetClass()->GetName();
+		return FLispNode::MakeSymbol(ClassName);
+	}
 }
 
 // ----- Convert a single exec node to Lisp -----
@@ -508,6 +545,206 @@ static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGrap
 	return FLispNode::MakeList(EventArgs);
 }
 
+// ============================================================================
+// ImportGraph helpers: Pure DAG reconstruction
+// ============================================================================
+
+/**
+ * Recursively build K2Nodes in Graph from a pure S-expression.
+ * Returns the output UEdGraphPin that represents the value of this expression,
+ * or nullptr on failure (in which case OutLiteralValue may be set for literals).
+ */
+static UEdGraphPin* BuildPureExprNode(
+	const FLispNodePtr& Expr,
+	UEdGraph* Graph,
+	UBlueprint* BP,
+	TArray<UEdGraphNode*>& CreatedNodes,
+	FString& OutLiteralValue)
+{
+	OutLiteralValue.Reset();
+	if (!Expr.IsValid() || Expr->IsNil()) return nullptr;
+
+	// --- Literals ---
+	if (Expr->IsNumber())
+	{
+		OutLiteralValue = FString::SanitizeFloat(Expr->NumberValue);
+		return nullptr;
+	}
+	if (Expr->IsString())
+	{
+		OutLiteralValue = Expr->StringValue;
+		return nullptr;
+	}
+	if (Expr->IsSymbol())
+	{
+		FString Sym = Expr->StringValue;
+		if (Sym == TEXT("true") || Sym == TEXT("false"))
+		{
+			OutLiteralValue = Sym;
+			return nullptr;
+		}
+		// Bare symbol -> member variable get
+		UK2Node_VariableGet* VarNode = NewObject<UK2Node_VariableGet>(Graph);
+		VarNode->VariableReference.SetSelfMember(FName(*Sym));
+		VarNode->CreateNewGuid();
+		VarNode->PostPlacedNewNode();
+		VarNode->AllocateDefaultPins();
+		Graph->AddNode(VarNode, false, false);
+		CreatedNodes.Add(VarNode);
+		for (UEdGraphPin* Pin : VarNode->Pins)
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+				return Pin;
+		return nullptr;
+	}
+
+	if (!Expr->IsList() || Expr->Num() == 0) return nullptr;
+
+	FLispNodePtr Head = Expr->Get(0);
+	if (!Head.IsValid()) return nullptr;
+
+	// --- (self.VarName) or single-element list ---
+	if (Head->IsSymbol())
+	{
+		FString Sym = Head->StringValue;
+
+		// (self.VarName) — single element list acting as member variable reference
+		if (Sym.StartsWith(TEXT("self.")))
+		{
+			FString VarName = Sym.Mid(5);
+			UK2Node_VariableGet* VarNode = NewObject<UK2Node_VariableGet>(Graph);
+			VarNode->VariableReference.SetSelfMember(FName(*VarName));
+			VarNode->CreateNewGuid();
+			VarNode->PostPlacedNewNode();
+			VarNode->AllocateDefaultPins();
+			Graph->AddNode(VarNode, false, false);
+			CreatedNodes.Add(VarNode);
+			for (UEdGraphPin* Pin : VarNode->Pins)
+				if (Pin && Pin->Direction == EGPD_Output
+					&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+					return Pin;
+			return nullptr;
+		}
+
+		// --- Enum comparison special nodes: == and != ---
+		// These correspond to UK2Node_EnumEquality / UK2Node_EnumInequality
+		if (Sym == TEXT("==") || Sym == TEXT("!="))
+		{
+			UK2Node* CompNode = nullptr;
+			if (Sym == TEXT("=="))
+				CompNode = NewObject<UK2Node_EnumEquality>(Graph);
+			else
+				CompNode = NewObject<UK2Node_EnumInequality>(Graph);
+
+			CompNode->CreateNewGuid();
+			CompNode->PostPlacedNewNode();
+			CompNode->AllocateDefaultPins();
+			Graph->AddNode(CompNode, false, false);
+			CreatedNodes.Add(CompNode);
+
+			// Connect arguments: first two non-exec input data pins
+			int32 ArgIdx = 1;
+			int32 DataPinIdx = 0;
+			for (UEdGraphPin* Pin : CompNode->Pins)
+			{
+				if (Pin->Direction != EGPD_Input) continue;
+				if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+				if (ArgIdx >= Expr->Num()) break;
+
+				FLispNodePtr ArgExpr = Expr->Get(ArgIdx);
+				if (ArgExpr->IsKeyword()) { ArgIdx++; if (ArgIdx >= Expr->Num()) break; ArgExpr = Expr->Get(ArgIdx); }
+
+				FString LiteralVal;
+				UEdGraphPin* ArgOutputPin = BuildPureExprNode(ArgExpr, Graph, BP, CreatedNodes, LiteralVal);
+				if (ArgOutputPin)
+					Pin->MakeLinkTo(ArgOutputPin);
+				else if (!LiteralVal.IsEmpty())
+					Pin->DefaultValue = LiteralVal;
+
+				ArgIdx++;
+				DataPinIdx++;
+				if (DataPinIdx >= 2) break; // EnumEquality has exactly 2 data inputs
+			}
+
+			// Return the bool output pin
+			if (UK2Node_EnumEquality* EqNode = Cast<UK2Node_EnumEquality>(CompNode))
+				return EqNode->GetReturnValuePin();
+			return nullptr;
+		}
+
+		// --- (FuncName arg0 arg1 ...) ---
+		// Find a matching pure UFunction by name
+		UFunction* TargetFunc = nullptr;
+		if (BP && BP->GeneratedClass)
+			TargetFunc = BP->GeneratedClass->FindFunctionByName(FName(*Sym));
+		if (!TargetFunc)
+		{
+			for (TObjectIterator<UFunction> It; It; ++It)
+			{
+				if (It->GetName() == Sym && It->HasAnyFunctionFlags(FUNC_BlueprintPure))
+				{
+					TargetFunc = *It;
+					break;
+				}
+			}
+		}
+
+		UK2Node_CallFunction* CallNode = NewObject<UK2Node_CallFunction>(Graph);
+		if (TargetFunc)
+		{
+			CallNode->SetFromFunction(TargetFunc);
+		}
+		else
+		{
+			CallNode->FunctionReference.SetExternalMember(FName(*Sym), nullptr);
+			UE_LOG(LogBlueprintLisp, Warning,
+				TEXT("ImportGraph: could not find UFunction '%s' — node may be incomplete"), *Sym);
+		}
+		CallNode->CreateNewGuid();
+		CallNode->PostPlacedNewNode();
+		CallNode->AllocateDefaultPins();
+		Graph->AddNode(CallNode, false, false);
+		CreatedNodes.Add(CallNode);
+
+		// Connect arguments to input data pins (positional, skip keywords as delimiters)
+		int32 ArgIdx = 1;
+		for (UEdGraphPin* Pin : CallNode->Pins)
+		{
+			if (Pin->Direction != EGPD_Input) continue;
+			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+			if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+			if (ArgIdx >= Expr->Num()) break;
+
+			FLispNodePtr ArgExpr = Expr->Get(ArgIdx);
+			// Skip keyword separators (:key) used for named args
+			if (ArgExpr->IsKeyword())
+			{
+				ArgIdx++;
+				if (ArgIdx >= Expr->Num()) break;
+				ArgExpr = Expr->Get(ArgIdx);
+			}
+
+			FString LiteralVal;
+			UEdGraphPin* ArgOutputPin = BuildPureExprNode(ArgExpr, Graph, BP, CreatedNodes, LiteralVal);
+			if (ArgOutputPin)
+				Pin->MakeLinkTo(ArgOutputPin);
+			else if (!LiteralVal.IsEmpty())
+				Pin->DefaultValue = LiteralVal;
+
+			ArgIdx++;
+		}
+
+		// Return the first non-exec output pin
+		for (UEdGraphPin* Pin : CallNode->Pins)
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+				return Pin;
+		return nullptr;
+	}
+
+	return nullptr;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -594,6 +831,109 @@ FBlueprintLispResult FBlueprintLispConverter::ExportByPath(
 	return Export(BP, GraphName, Options);
 }
 
+FBlueprintLispResult FBlueprintLispConverter::ExportGraph(
+	UEdGraph* Graph,
+	const FExportOptions& Options)
+{
+	if (!Graph)
+		return FBlueprintLispResult::Fail(TEXT("ExportGraph: Graph is null"));
+
+	TArray<FGuid> EventGuids, NodeGuids;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (Cast<UK2Node_CustomEvent>(Node) || Cast<UK2Node_Event>(Node))
+			EventGuids.Add(Node->NodeGuid);
+		else if (Node->NodeGuid.IsValid())
+			NodeGuids.Add(Node->NodeGuid);
+	}
+	TMap<FGuid, FString> ShortEventIds = Options.bStableIds ? ComputeShortIds(EventGuids) : TMap<FGuid,FString>();
+	TMap<FGuid, FString> ShortNodeIds  = Options.bStableIds ? ComputeShortIds(NodeGuids)  : TMap<FGuid,FString>();
+
+	TArray<FString> Forms;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UK2Node_CustomEvent* CE = Cast<UK2Node_CustomEvent>(Node))
+		{
+			FLispNodePtr Form = ConvertCustomEventToLisp(CE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
+		}
+		else if (UK2Node_Event* E = Cast<UK2Node_Event>(Node))
+		{
+			FLispNodePtr Form = ConvertEventToLisp(E, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
+		}
+	}
+
+	// Function-graph mode: handles AnimationTransitionGraph and other pure-expression graphs
+	// that have a Result/Sink node but no Event entry node.
+	// We locate the sink node, find its bool input pin, and export the pure DAG as (transition-cond <expr>).
+	if (Forms.IsEmpty())
+	{
+		UAnimationTransitionGraph* TransGraph = Cast<UAnimationTransitionGraph>(Graph);
+		UAnimGraphNode_TransitionResult* ResultNode = TransGraph ? TransGraph->GetResultNode() : nullptr;
+		if (!ResultNode)
+		{
+			// Fallback: look for any node that is a "sink" (IsNodeRootSet)
+			for (UEdGraphNode* N : Graph->Nodes)
+			{
+				if (UK2Node* K2N = Cast<UK2Node>(N))
+				{
+					// Check class name as fallback
+					if (N->GetClass()->GetName().Contains(TEXT("TransitionResult")))
+					{
+						ResultNode = Cast<UAnimGraphNode_TransitionResult>(N);
+						break;
+					}
+				}
+			}
+		}
+
+		if (ResultNode)
+		{
+			// Find the bool input pin (bCanEnterTransition)
+			UEdGraphPin* BoolPin = nullptr;
+			for (UEdGraphPin* Pin : ResultNode->Pins)
+			{
+				if (Pin && Pin->Direction == EGPD_Input
+					&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+				{
+					BoolPin = Pin;
+					break;
+				}
+			}
+
+			if (BoolPin)
+			{
+				TSet<UEdGraphNode*> Visited;
+				FLispNodePtr CondExpr = ConvertPureExpressionToLisp(BoolPin, Graph, Visited);
+
+				// Wrap in (transition-cond <expr>)
+				TArray<FLispNodePtr> Form;
+				Form.Add(FLispNode::MakeSymbol(TEXT("transition-cond")));
+				Form.Add(CondExpr.IsValid() ? CondExpr : FLispNode::MakeSymbol(TEXT("true")));
+				FLispNodePtr TransForm = FLispNode::MakeList(Form);
+				Forms.Add(TransForm->ToString(Options.bPrettyPrint, 0));
+			}
+			else
+			{
+				return FBlueprintLispResult::Fail(TEXT("ExportGraph: TransitionResult has no bool input pin"));
+			}
+		}
+		else
+		{
+			return FBlueprintLispResult::Fail(TEXT("No event nodes found in graph (not an EventGraph, and no TransitionResult found)"));
+		}
+	}
+
+	FString Code;
+	for (int32 i = 0; i < Forms.Num(); i++)
+	{
+		if (i > 0) Code += TEXT("\n\n");
+		Code += Forms[i];
+	}
+	return FBlueprintLispResult::Ok(Code);
+}
+
 FBlueprintLispResult FBlueprintLispConverter::Validate(const FString& LispCode)
 {
 	FLispParseResult PR = FLispParser::Parse(LispCode);
@@ -606,7 +946,10 @@ FBlueprintLispResult FBlueprintLispConverter::Validate(const FString& LispCode)
 		if (!Node.IsValid() || !Node->IsList())
 			return FBlueprintLispResult::Fail(TEXT("Top-level expressions must be lists"));
 		FString Form = Node->GetFormName().ToLower();
-		static const TSet<FString> ValidForms = {TEXT("event"),TEXT("func"),TEXT("macro"),TEXT("var"),TEXT("comment")};
+		static const TSet<FString> ValidForms = {
+			TEXT("event"), TEXT("func"), TEXT("macro"), TEXT("var"), TEXT("comment"),
+			TEXT("transition-cond")  // function-graph mode: pure bool expression for AnimationTransitionGraph
+		};
 		if (!ValidForms.Contains(Form))
 			return FBlueprintLispResult::Fail(FString::Printf(TEXT("Unknown top-level form: %s"), *Form));
 	}
@@ -620,9 +963,112 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	const FString& /*LispCode*/,
 	const FImportOptions& /*Options*/)
 {
-	// TODO: Import (DSL -> Blueprint) is a large undertaking (~5000 lines from ECABridge).
+	// TODO: Import (DSL -> Blueprint) is not yet implemented.
 	// It will be implemented in a follow-up.
-	return FBlueprintLispResult::Fail(TEXT("BlueprintLisp Import is not yet implemented. Use ECABridge lisp_to_blueprint command for now."));
+	return FBlueprintLispResult::Fail(TEXT("BlueprintLisp Import is not yet implemented."));
+}
+
+FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
+	UEdGraph* Graph,
+	const FString& LispCode,
+	const FImportOptions& Options)
+{
+	if (!Graph)
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: Graph is null"));
+
+	// Parse the DSL
+	FLispParseResult PR = FLispParser::Parse(LispCode);
+	if (!PR.bSuccess)
+		return FBlueprintLispResult::Fail(FString::Printf(TEXT("ImportGraph: parse error at %d:%d: %s"),
+			PR.ErrorLine, PR.ErrorColumn, *PR.Error));
+
+	if (PR.Nodes.IsEmpty())
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: no top-level expressions"));
+
+	FLispNodePtr TopExpr = PR.Nodes[0];
+	if (!TopExpr.IsValid() || !TopExpr->IsList())
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: top-level expression must be a list"));
+
+	FString FormName = TopExpr->GetFormName().ToLower();
+	if (FormName != TEXT("transition-cond"))
+		return FBlueprintLispResult::Fail(FString::Printf(TEXT("ImportGraph: expected (transition-cond ...), got (%s ...)"), *FormName));
+
+	if (TopExpr->Num() < 2)
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: (transition-cond) missing condition expression"));
+
+	// Clear existing nodes if requested (keep only the Result node)
+	if (Options.bClearExisting)
+	{
+		TArray<UEdGraphNode*> NodesToRemove;
+		for (UEdGraphNode* N : Graph->Nodes)
+		{
+			// Keep TransitionResult
+			if (!Cast<UAnimGraphNode_TransitionResult>(N))
+				NodesToRemove.Add(N);
+		}
+		for (UEdGraphNode* N : NodesToRemove)
+			Graph->RemoveNode(N);
+	}
+
+	// Find or create the TransitionResult node
+	UAnimGraphNode_TransitionResult* ResultNode = nullptr;
+	UAnimationTransitionGraph* TransGraph = Cast<UAnimationTransitionGraph>(Graph);
+	if (TransGraph)
+		ResultNode = TransGraph->GetResultNode();
+	if (!ResultNode)
+	{
+		for (UEdGraphNode* N : Graph->Nodes)
+			if (UAnimGraphNode_TransitionResult* TR = Cast<UAnimGraphNode_TransitionResult>(N))
+				{ ResultNode = TR; break; }
+	}
+	if (!ResultNode)
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: no TransitionResult node found in graph"));
+
+	// Find the bool input pin
+	UEdGraphPin* BoolInputPin = nullptr;
+	for (UEdGraphPin* Pin : ResultNode->Pins)
+		if (Pin && Pin->Direction == EGPD_Input
+			&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Boolean)
+			{ BoolInputPin = Pin; break; }
+
+	if (!BoolInputPin)
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: TransitionResult has no bool input pin"));
+
+	// Build owner Blueprint reference for function lookup
+	UBlueprint* OwnerBP = Graph->GetTypedOuter<UBlueprint>();
+
+	// Build the pure expression tree
+	FLispNodePtr CondExpr = TopExpr->Get(1);
+	TArray<UEdGraphNode*> CreatedNodes;
+	FString LiteralVal;
+	UEdGraphPin* OutputPin = BuildPureExprNode(CondExpr, Graph, OwnerBP, CreatedNodes, LiteralVal);
+
+	if (OutputPin)
+	{
+		// Break any existing links on the bool pin
+		BoolInputPin->BreakAllPinLinks();
+		BoolInputPin->MakeLinkTo(OutputPin);
+	}
+	else if (!LiteralVal.IsEmpty())
+	{
+		BoolInputPin->DefaultValue = LiteralVal;
+	}
+	else
+	{
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: condition expression produced no output pin"));
+	}
+
+	// Simple auto-layout: place created nodes to the left of ResultNode
+	float X = ResultNode->NodePosX - 300.0f;
+	for (int32 i = 0; i < CreatedNodes.Num(); i++)
+	{
+		CreatedNodes[i]->NodePosX = X;
+		CreatedNodes[i]->NodePosY = ResultNode->NodePosY + (i - CreatedNodes.Num() / 2) * 80.0f;
+		X -= 220.0f;
+	}
+
+	UE_LOG(LogBlueprintLisp, Log, TEXT("ImportGraph: restored transition condition (%d nodes created)"), CreatedNodes.Num());
+	return FBlueprintLispResult::Ok(LispCode);
 }
 
 FBlueprintLispResult FBlueprintLispConverter::ImportByPath(
@@ -643,7 +1089,7 @@ FBlueprintLispResult FBlueprintLispConverter::Update(
 	const FString& /*NewLispCode*/,
 	const FUpdateOptions& /*Options*/)
 {
-	// TODO: Incremental update via semantic diff (Phase 3 in ECABridge).
+	// TODO: Incremental update via semantic diff is not yet implemented.
 	return FBlueprintLispResult::Fail(TEXT("BlueprintLisp incremental Update is not yet implemented."));
 }
 
