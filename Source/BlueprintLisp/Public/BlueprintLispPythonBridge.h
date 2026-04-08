@@ -94,6 +94,20 @@ public:
 		bool bIncludePositions = false,
 		bool bStableIds = true);
 
+	/**
+	 * Export the named graph to the default .bplisp file path.
+	 * Path convention: {Project}/Saved/BP2DSL/BlueprintLisp/{RelPath}/{GraphName}.bplisp
+	 * e.g. /Game/Props/BP_Door + "EventGraph"
+	 *   -> Saved/BP2DSL/BlueprintLisp/Props/BP_Door/EventGraph.bplisp
+	 * Creates intermediate directories as needed.
+	 */
+	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
+	static FBlueprintLispPythonResult ExportGraphToDefaultPath(
+		const FString& BlueprintPath,
+		const FString& GraphName = TEXT("EventGraph"),
+		bool bIncludePositions = false,
+		bool bStableIds = true);
+
 	// ---------------------------------------------------------------
 	// Import  (DSL text -> Blueprint graph)
 	// ---------------------------------------------------------------
@@ -157,6 +171,20 @@ public:
 		const FString& InputFilePath,
 		bool bCompile = true,
 		bool bSavePackage = true);
+
+	// ---------------------------------------------------------------
+	// Query
+	// ---------------------------------------------------------------
+
+	/**
+	 * List all graph names in a Blueprint.
+	 * Returns graph names in DSLText, one per line, prefixed with type:
+	 *   [Ubergraph] EventGraph
+	 *   [Function] FuncName
+	 *   [Macro] MacroName
+	 */
+	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
+	static FBlueprintLispPythonResult ListGraphs(const FString& BlueprintPath);
 
 	// ---------------------------------------------------------------
 	// Validation

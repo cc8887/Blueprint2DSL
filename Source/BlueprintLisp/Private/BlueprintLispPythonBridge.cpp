@@ -3,6 +3,7 @@
 
 #include "BlueprintLispPythonBridge.h"
 #include "BlueprintLispConverter.h"
+#include "FBlueprintLispMappingRegistry.h"
 
 #include "Engine/Blueprint.h"
 #include "FileHelpers.h"
@@ -174,6 +175,27 @@ FBlueprintLispPythonResult UBlueprintLispPythonBridge::ExportGraphToFile(
 	return Result;
 }
 
+FBlueprintLispPythonResult UBlueprintLispPythonBridge::ExportGraphToDefaultPath(
+	const FString& BlueprintPath,
+	const FString& GraphName,
+	bool bIncludePositions,
+	bool bStableIds)
+{
+	// Resolve default DSL file path via MappingRegistry
+	FString DefaultPath = FBlueprintLispMappingRegistry::BlueprintToDSLPath(BlueprintPath, GraphName);
+	if (DefaultPath.IsEmpty())
+	{
+		return BPLispBridge::MakeFailure(FString::Printf(
+			TEXT("Cannot determine default DSL path for '%s' graph '%s' (invalid or non-exportable package)"),
+			*BlueprintPath, *GraphName));
+	}
+
+	// Delegate to ExportGraphToFile
+	FBlueprintLispPythonResult Result = ExportGraphToFile(
+		BlueprintPath, DefaultPath, GraphName, bIncludePositions, bStableIds);
+	return Result;
+}
+
 // ========== Import ==========
 
 FBlueprintLispPythonResult UBlueprintLispPythonBridge::ImportGraphFromText(
@@ -295,6 +317,46 @@ FBlueprintLispPythonResult UBlueprintLispPythonBridge::UpdateGraphFromFile(
 	}
 	FBlueprintLispPythonResult Result = UpdateGraphFromText(BlueprintPath, GraphName, DSLText, bCompile, bSavePackage);
 	Result.FilePath = InputFilePath;
+	return Result;
+}
+
+// ========== Query ==========
+
+FBlueprintLispPythonResult UBlueprintLispPythonBridge::ListGraphs(const FString& BlueprintPath)
+{
+	FString ResolvedPath;
+	FString Error;
+	UBlueprint* BP = BPLispBridge::LoadBlueprintByPath(BlueprintPath, ResolvedPath, Error);
+	if (!BP)
+	{
+		return BPLispBridge::MakeFailure(Error);
+	}
+
+	FString GraphList;
+	GraphList.Reserve(256);
+
+	auto AppendGraph = [&GraphList](const TCHAR* Type, UEdGraph* G)
+	{
+		if (!G) return;
+		if (!GraphList.IsEmpty()) GraphList += TEXT("\n");
+		GraphList += FString::Printf(TEXT("[%s] %s"), Type, *G->GetName());
+	};
+
+	for (UEdGraph* G : BP->UbergraphPages)
+		AppendGraph(TEXT("Ubergraph"), G);
+	for (UEdGraph* G : BP->FunctionGraphs)
+		AppendGraph(TEXT("Function"), G);
+	for (UEdGraph* G : BP->MacroGraphs)
+		AppendGraph(TEXT("Macro"), G);
+	// Note: EventDrivenTaskGraphs was removed in UE5.5 - skip this graph type
+
+	FBlueprintLispPythonResult Result;
+	Result.bSuccess = true;
+	Result.AssetPath = ResolvedPath;
+	Result.DSLText = GraphList;
+	Result.Message = FString::Printf(TEXT("Found %d graphs in %s"),
+		BP->UbergraphPages.Num() + BP->FunctionGraphs.Num() + BP->MacroGraphs.Num(),
+		*ResolvedPath);
 	return Result;
 }
 
