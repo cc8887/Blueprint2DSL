@@ -4,6 +4,7 @@
 #include "BlueprintLispPythonBridge.h"
 #include "BlueprintLispConverter.h"
 #include "FBlueprintLispMappingRegistry.h"
+#include "BPNodeExporter.h"
 
 #include "Engine/Blueprint.h"
 #include "FileHelpers.h"
@@ -378,4 +379,33 @@ FBlueprintLispPythonResult UBlueprintLispPythonBridge::ValidateDSL(const FString
 		? TEXT("DSL syntax is valid")
 		: FString::Printf(TEXT("DSL validation failed: %s"), *LispResult.Error);
 	return Result;
+}
+
+// ========== Stub Export ==========
+
+FBlueprintLispPythonResult UBlueprintLispPythonBridge::ExportStub(const FString& OutputFilePath)
+{
+#if WITH_EDITOR
+	FString StubPath = OutputFilePath;
+	if (StubPath.TrimStartAndEnd().IsEmpty())
+	{
+		StubPath = FPaths::ProjectDir() / TEXT("Saved") / TEXT("BP2DSL") / TEXT("BlueprintLisp") / TEXT("bplisp-stub.scm");
+	}
+	FPaths::NormalizeFilename(StubPath);
+
+	bool bOk = FBPNodeExporter::ExportAllNodes(StubPath);
+
+	FBlueprintLispPythonResult Result;
+	Result.bSuccess = bOk;
+	Result.FilePath = StubPath;
+	Result.Message = bOk
+		? FString::Printf(TEXT("Blueprint node stub exported to: %s"), *StubPath)
+		: TEXT("Failed to export blueprint node stub");
+	return Result;
+#else
+	FBlueprintLispPythonResult Result;
+	Result.bSuccess = false;
+	Result.Message = TEXT("Stub export is only available in editor builds");
+	return Result;
+#endif
 }

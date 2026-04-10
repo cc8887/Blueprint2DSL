@@ -196,4 +196,17 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
 	static FBlueprintLispPythonResult ValidateDSL(const FString& DSLText);
+
+	// ---------------------------------------------------------------
+	// Stub Export
+	// ---------------------------------------------------------------
+
+	/**
+	 * Export all UK2Node type definitions to a stub file.
+	 * Outputs S-expression format with pin signatures for Lint/validation.
+	 * Default path: {Project}/Saved/BP2DSL/BlueprintLisp/bplisp-stub.scm
+	 */
+	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
+	static FBlueprintLispPythonResult ExportStub(
+		const FString& OutputFilePath = TEXT(""));
 };
