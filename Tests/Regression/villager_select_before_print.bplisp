@@ -1,0 +1,42 @@
+(function
+  None
+  :event-id "8abce957"
+  :param (Selected Actor)
+  (PrintString
+    :instring "Villager Select called!"
+    :bprinttoscreen true
+    :bprinttolog true
+    :textcolor "(R=0,G=1,B=0,A=1)"
+    :duration 5
+    :key "None"
+    :id "5f6936c3")
+  (set
+    Selected
+    "K2Node_FunctionEntry"
+    :id "226de0c6")
+  (let
+    returnvalue
+    (SpawnSystemAttached
+      :attachpointname "None"
+      :location "0, 0, 0"
+      :rotation "0, 0, 0"
+      :locationtype "SnapToTarget"
+      :bautodestroy false
+      :bautoactivate true
+      :poolingmethod "None"
+      :bprecullcheck true
+      :id "60944b57"))
+  (set
+    NS_Path
+    "...circular..."
+    :id "a1f38460")
+  (let
+    returnvalue
+    (K2_SetTimer
+      :functionname "Update Path"
+      :time 0.01
+      :blooping true
+      :bmaxonceperframe false
+      :initialstartdelay 0
+      :initialstartdelayvariance 0
+      :id "c1d52411")))

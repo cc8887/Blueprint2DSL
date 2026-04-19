@@ -1,0 +1,81 @@
+{
+  "suite_name": "BlueprintLisp Regression Cases",
+  "common_args": [
+    "-DDC-ForceMemoryCache"
+  ],
+  "default_timeout_seconds": 900,
+  "cases": [
+    {
+      "id": "villager_select_symbol_repair_roundtrip",
+      "script_path": "repair_villager_select_symbol_test.py",
+      "result_path": "repair_villager_select_symbol_test_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Core/Player/BP_Player :: Villager Select",
+      "issue": "函数入口参数源与已执行节点输出曾退化成 K2Node_FunctionEntry / ...circular... 占位",
+      "notes": "导入修正 DSL 后重新导出，必须保留正确符号并保留关键调用。"
+    },
+    {
+      "id": "villager_select_exec_chain_preservation",
+      "script_path": "roundtrip_villager_select_exec_chain_cropout.py",
+      "result_path": "roundtrip_villager_select_exec_chain_cropout_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Core/Player/BP_Player :: Villager Select",
+      "issue": "在 FunctionGraph 中插入新节点后，SpawnSystemAttached / K2_SetTimer 曾因 let/exec 处理不当而丢失",
+      "notes": "测试脚本会自动恢复原图，要求新增 Debug Print 的同时保住关键调用和干净符号。"
+    },
+    {
+      "id": "array_pure_expr_roundtrip",
+      "script_path": "roundtrip_array_pure_expr_cropout.py",
+      "result_path": "roundtrip_array_pure_expr_cropout_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/BPLispTests/BP_BPLispEventImportTest :: EventGraph",
+      "issue": "make-array / get-array-item 纯表达式曾缺失导入实现",
+      "notes": "回归时必须保留 make-array、get-array-item 与关键字符串字面量。"
+    },
+    {
+      "id": "foreach_make_array_string_fidelity",
+      "script_path": "roundtrip_endplay_foreach_bp_stone.py",
+      "result_path": "roundtrip_endplay_foreach_bp_stone_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Interactable/Resources/BP_Stone :: EventGraph",
+      "issue": "make-array 直接接 ForEachLoop wildcard 输入时，字符串元素值曾回导出塌成 nil",
+      "notes": "要求 Loop0~Loop9 全保留，且 make-array 中 nil 数量为 0。"
+    },
+    {
+      "id": "foreach_loop_item_symbol_reference",
+      "script_path": "roundtrip_endplay_loop_item_bp_shrub.py",
+      "result_path": "roundtrip_endplay_loop_item_bp_shrub_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Interactable/Resources/BP_Shrub :: EventGraph",
+      "issue": "ForEachLoop 的 ArrayElement 作为后续节点输入时，必须稳定回导出为符号引用而不是字符串字面量",
+      "notes": "2026-04-18 已修复，现要求回导出继续保留 Array Element 符号引用、字符串数组值以及干净恢复。"
+    },
+    {
+      "id": "foreach_loop_item_nested_pure_chain",
+      "script_path": "roundtrip_endplay_loop_item_pure_chain_bp_shrub.py",
+      "result_path": "roundtrip_endplay_loop_item_pure_chain_bp_shrub_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Interactable/Resources/BP_Shrub :: EventGraph",
+      "issue": "ForEachLoop 的 Array Element / Array Index 进入嵌套 pure expression 后，必须继续保持符号引用与结构保真",
+      "notes": "要求回导出继续保留 get-array-item、嵌套 make-array、Array Element / Array Index 两个符号，以及干净恢复。"
+    },
+    {
+      "id": "call_parent_event_roundtrip",
+      "script_path": "roundtrip_call_parent_bp_shrub.py",
+      "result_path": "roundtrip_call_parent_bp_shrub_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/Interactable/Resources/BP_Shrub :: EventGraph",
+      "issue": "EventGraph 中的父类 override 调用必须稳定回导出为 call-parent，并保留 OtherActor / DeltaSeconds 参数映射",
+      "notes": "脚本会临时追加一个 probe event，再确认 3 条 call-parent 在 modified/restored 两轮回导出里都完整存在。"
+    },
+    {
+      "id": "edge_move_function_graph_macro_output_selection",
+      "script_path": "roundtrip_edge_move_function_graph.py",
+      "result_path": "roundtrip_edge_move_function_graph_result.json",
+      "expected_success": true,
+      "target": "/Game/Blueprint/BPLispTests/BP_Player_EdgeScrollLike_Test :: WB_ApplyEdgeMoveLike",
+      "issue": "FunctionGraph 中多输出 call-macro 在裸内联写法下曾误把 Direction 连到 ScaleValue，导致导入失败或退化为默认值",
+      "notes": "要求 inline_double_call_macro 与显式 :out 版本都能成功导入，并回导出为同一份规范化结构。"
+    }
+  ]
+}
