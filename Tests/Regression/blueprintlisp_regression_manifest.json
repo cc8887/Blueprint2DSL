@@ -186,9 +186,30 @@
       "target": "/Game/AnimBP2FP/Phase5/ALS_DemoLevel_ActorBoundEventReuseProbe :: EventGraph",
       "issue": "actor-bound-event 根入口虽然导出带 :event-id，但 MergeAppend update 过去仍会直接新建 UK2Node_ActorBoundEvent，导致 LevelScript 里的 event identity 漂移。",
       "notes": "最小 probe 会复制 ALS_DemoLevel 并创建一个带固定 label 的 actor，仅检查 actor-bound-event 的 :event-id 在 update 前后保持不变，且 body 文本更新成功。"
+    },
+    {
+      "id": "incremental_function_seq_reuse",
+      "script_path": "incremental_function_seq_reuse_probe.py",
+      "result_path": "incremental_function_seq_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/BP_FunctionSeqReuseProbe :: WB_SeqReuseProbe",
+      "issue": "带稳定 :id 的 seq 过去只会被当成线性 wrapper 导入/导出，导致真实 UK2Node_ExecutionSequence 无法在 update 前后保持同一份 identity。",
+      "notes": "最小 probe 在 FunctionGraph 中导入一个带 :id 的 seq，要求首次导出能稳定保留 (seq ... :id ...)，且 update 后 seq 的 :id 完全一致。"
+    },
+    {
+      "id": "incremental_macro_exit_generic_reuse",
+      "script_path": "incremental_macro_exit_generic_reuse_probe.py",
+      "result_path": "incremental_macro_exit_generic_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "E:\\Cropout\\Cropout.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_Player_MacroExitGenericReuseProbe :: Villager Overlap Check",
+      "issue": "macro body 里的 generic fallback 与 exit 过去虽然可被 update 命中，但 exit tunnel 会在 finalize 阶段被误删或导出时丢失 :id。",
+      "notes": "probe 复制 BP_Player 的 Villager Overlap Check 宏图，要求 generic fallback 与 exit 的 :id 在 update 前后都保持一致，且不触发 ReplaceGraph fallback。"
     }
   ]
 }
+
 
 
 

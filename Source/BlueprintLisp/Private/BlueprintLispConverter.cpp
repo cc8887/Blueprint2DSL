@@ -136,6 +136,15 @@ static FLispNodePtr AppendNodeId(FLispNodePtr Form, UEdGraphNode* Node, const TM
 	return Form;
 }
 
+static bool BP_IsStructuralSeqWrapper(const FLispNodePtr& Body)
+{
+	return Body.IsValid()
+		&& Body->IsList()
+		&& Body->IsForm(TEXT("seq"))
+		&& !Body->HasKeyword(TEXT(":id"));
+}
+
+
 /** Get clean function name from a K2Node_CallFunction */
 static FString GetCleanNodeName(UEdGraphNode* Node)
 {
@@ -750,7 +759,7 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 				{
 					continue;
 				}
-				if (Body->IsForm(TEXT("seq")))
+				if (BP_IsStructuralSeqWrapper(Body))
 				{
 					for (int32 BodyIdx = 1; BodyIdx < Body->Num(); ++BodyIdx)
 					{
@@ -761,6 +770,7 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 				{
 					Args.Add(Body);
 				}
+
 			}
 		}
 		return AppendNodeId(FLispNode::MakeList(Args), Node, ShortIds);
@@ -882,10 +892,11 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 		if (NodeLisp.IsValid() && !NodeLisp->IsNil())
 			Statements.Add(NodeLisp);
 
-		// branch terminates the chain (branches handled inside ConvertNodeToLisp)
-		if (Cast<UK2Node_IfThenElse>(NextNode)) break;
+		// branch / sequence terminate the chain (their downstream exec paths are handled inside ConvertNodeToLisp)
+		if (Cast<UK2Node_IfThenElse>(NextNode) || Cast<UK2Node_ExecutionSequence>(NextNode)) break;
 
 		// Exit tunnel terminates the chain (macro exit point)
+
 		// But MacroInstance is NOT an exit tunnel — it continues the exec chain.
 		if (UK2Node_Tunnel* TE = Cast<UK2Node_Tunnel>(NextNode))
 		{
@@ -937,7 +948,7 @@ static void AppendExecBodyToArgs(TArray<FLispNodePtr>& EventArgs, UEdGraphPin* E
 	FLispNodePtr Body = ConvertExecChainToLisp(ExecOutPin, Graph, Visited, bPositions, ShortNodeIds);
 	if (!Body.IsValid() || Body->IsNil()) return;
 
-	if (Body->IsForm(TEXT("seq")))
+	if (BP_IsStructuralSeqWrapper(Body))
 	{
 		for (int32 i = 1; i < Body->Num(); i++)
 		{
@@ -948,6 +959,7 @@ static void AppendExecBodyToArgs(TArray<FLispNodePtr>& EventArgs, UEdGraphPin* E
 	{
 		EventArgs.Add(Body);
 	}
+
 }
 
 static bool EXP_ShouldSkipCustomEventParamPin(UK2Node_CustomEvent* Event, UEdGraphPin* Pin)
@@ -1169,10 +1181,11 @@ static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGrap
 	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, Visited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
-		if (Body->IsForm(TEXT("seq")))
+		if (BP_IsStructuralSeqWrapper(Body))
 			for (int32 i = 1; i < Body->Num(); i++) EventArgs.Add(Body->Get(i));
 		else EventArgs.Add(Body);
 	}
+
 
 	return FLispNode::MakeList(EventArgs);
 }
@@ -1257,10 +1270,11 @@ static FLispNodePtr ConvertFunctionEntryToLisp(UK2Node_FunctionEntry* FuncEntry,
 	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, Visited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
-		if (Body->IsForm(TEXT("seq")))
+		if (BP_IsStructuralSeqWrapper(Body))
 			for (int32 i = 1; i < Body->Num(); i++) FuncArgs.Add(Body->Get(i));
 		else FuncArgs.Add(Body);
 	}
+
 
 	return FLispNode::MakeList(FuncArgs);
 }
@@ -1358,10 +1372,11 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 	FLispNodePtr Body = ConvertExecChainToLisp(TunnelExecOut, Graph, Visited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
-		if (Body->IsForm(TEXT("seq")))
+		if (BP_IsStructuralSeqWrapper(Body))
 			for (int32 i = 1; i < Body->Num(); i++) MacroArgs.Add(Body->Get(i));
 		else MacroArgs.Add(Body);
 	}
+
 	else if (!TunnelExecOut)
 	{
 		// Pure-data macro: no exec flow. Trace data dependencies from exit tunnel inputs.
@@ -1948,7 +1963,131 @@ static UK2Node_SwitchInteger* IMP_CreateOrReuseSwitchIntegerNode(const FLispNode
 	return SwitchNode;
 }
 
+static int32 IMP_CountExecOutputPins(UEdGraphNode* Node)
+{
+	int32 ExecOutputCount = 0;
+	if (!Node)
+	{
+		return ExecOutputCount;
+	}
+
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (Pin && Pin->Direction == EGPD_Output && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+		{
+			++ExecOutputCount;
+		}
+	}
+
+	return ExecOutputCount;
+}
+
+static bool IMP_IsCompatibleExistingSequenceNode(UK2Node_ExecutionSequence* SequenceNode, int32 RequestedBranchCount)
+{
+	if (!SequenceNode)
+	{
+		return false;
+	}
+
+	const int32 RequestedExecOutputs = FMath::Max(RequestedBranchCount, 2);
+	return IMP_CountExecOutputPins(SequenceNode) == RequestedExecOutputs;
+}
+
+static UK2Node_ExecutionSequence* IMP_CreateOrReuseSequenceNode(const FLispNodePtr& Form, int32 RequestedBranchCount, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_ExecutionSequence* ReusableSequenceNode = Cast<UK2Node_ExecutionSequence>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingSequenceNode(ReusableSequenceNode, RequestedBranchCount))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableSequenceNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableSequenceNode;
+			}
+		}
+	}
+
+	UK2Node_ExecutionSequence* SequenceNode = NewObject<UK2Node_ExecutionSequence>(Ctx.Graph);
+	SequenceNode->NodePosX = Ctx.CurrentX;
+	SequenceNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(SequenceNode, false, false);
+	SequenceNode->AllocateDefaultPins();
+	const int32 RequestedExecOutputs = FMath::Max(RequestedBranchCount, 2);
+	while (IMP_CountExecOutputPins(SequenceNode) < RequestedExecOutputs)
+	{
+		SequenceNode->AddInputPin();
+	}
+	IMP_EnsureGuid(SequenceNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), SequenceNode);
+	Ctx.TempIdToNode.Add(SequenceNode->NodeGuid.ToString(), SequenceNode);
+	return SequenceNode;
+}
+
+static bool IMP_IsOpaqueGenericFallbackForm(const FLispNodePtr& Form)
+{
+	if (!Form.IsValid() || !Form->IsList() || Form->Num() < 3)
+	{
+		return false;
+	}
+
+	bool bHasStableId = false;
+	for (int32 i = 1; i < Form->Num(); ++i)
+	{
+		const FLispNodePtr Part = Form->Get(i);
+		if (!Part.IsValid())
+		{
+			continue;
+		}
+		if (!Part->IsKeyword())
+		{
+			return false;
+		}
+
+		const FString KeywordName = Part->StringValue.StartsWith(TEXT(":")) ? Part->StringValue.Mid(1) : Part->StringValue;
+		if (KeywordName.Equals(TEXT("id"), ESearchCase::IgnoreCase))
+		{
+			bHasStableId = true;
+		}
+
+		if (i + 1 >= Form->Num())
+		{
+			return false;
+		}
+
+		const FLispNodePtr Value = Form->Get(i + 1);
+		if (Value.IsValid() && Value->IsList())
+		{
+			return false;
+		}
+
+		i += 1;
+	}
+
+	return bHasStableId;
+}
+
+static UEdGraphNode* IMP_TryReuseOpaqueGenericBodyNode(const FLispNodePtr& Form, FBPImportContext& Ctx)
+{
+	if (!IMP_IsOpaqueGenericFallbackForm(Form))
+	{
+		return nullptr;
+	}
+
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		Ctx.ConsumedReusableBodyGuids.Add(ReusableNode->NodeGuid);
+		Ctx.TempIdToNode.FindOrAdd(ReusableNode->NodeGuid.ToString()) = ReusableNode;
+		Ctx.AdvancePosition();
+		return ReusableNode;
+	}
+
+	return nullptr;
+}
+
 static FString IMP_GetExistingCallNodeName(UK2Node_CallFunction* CallNode)
+
 {
 
 
@@ -3830,6 +3969,45 @@ static UK2Node_Tunnel* IMP_FindMacroExitTunnel(UEdGraph* Graph, const FString& E
 	return ExitName.IsEmpty() ? FirstExit : nullptr;
 }
 
+static bool IMP_IsCompatibleExistingMacroExitTunnel(UK2Node_Tunnel* Tunnel, const FString& ExitName)
+{
+	if (!Tunnel || Tunnel->DrawNodeAsEntry() || Cast<UK2Node_MacroInstance>(Tunnel))
+	{
+		return false;
+	}
+
+	const FString TunnelName = Tunnel->GetNodeTitle(ENodeTitleType::ListView).ToString();
+	return ExitName.IsEmpty() || TunnelName.Equals(ExitName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_Tunnel* IMP_FindReusableMacroExitTunnel(const FLispNodePtr& Form, UEdGraph* Graph, const FString& ExitName)
+{
+	if (!Graph)
+	{
+		return nullptr;
+	}
+
+	const FString RequestedId = IMP_GetRequestedNodeStableId(Form);
+	if (!RequestedId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Graph, false, StableIdToNode, nullptr, nullptr);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedId))
+		{
+			if (UK2Node_Tunnel* ReusableTunnel = Cast<UK2Node_Tunnel>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingMacroExitTunnel(ReusableTunnel, ExitName))
+				{
+					return ReusableTunnel;
+				}
+			}
+		}
+	}
+
+	return IMP_FindMacroExitTunnel(Graph, ExitName);
+}
+
+
 static FString IMP_ExtractCompoundName(const FLispNodePtr& Form, int32 StartIndex, int32& OutArgStartIndex)
 {
 	OutArgStartIndex = StartIndex + 1;
@@ -5243,15 +5421,47 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 
 	FString FormName = Form->GetFormName();
 
-	// (seq s1 s2 ...) — execute in order
+	// (seq s1 s2 ...) — execute in order; if it carries :id, treat it as an actual UK2Node_ExecutionSequence
 	if (FormName.Equals(TEXT("seq"), ESearchCase::IgnoreCase))
 	{
+		TArray<FLispNodePtr> SequenceBodies;
+		for (int32 i = 1; i < Form->Num(); ++i)
+		{
+			const FLispNodePtr Part = Form->Get(i);
+			if (!Part.IsValid())
+			{
+				continue;
+			}
+			if (Part->IsKeyword())
+			{
+				i += 1;
+				continue;
+			}
+			SequenceBodies.Add(Part);
+		}
+
+		if (!IMP_GetRequestedNodeStableId(Form).IsEmpty())
+		{
+			UK2Node_ExecutionSequence* SequenceNode = IMP_CreateOrReuseSequenceNode(Form, SequenceBodies.Num(), Ctx);
+			for (int32 BranchIndex = 0; BranchIndex < SequenceBodies.Num(); ++BranchIndex)
+			{
+				if (UEdGraphPin* BranchExecPin = SequenceNode->GetThenPinGivenIndex(BranchIndex))
+				{
+					UEdGraphPin* MutableBranchExecPin = BranchExecPin;
+					IMP_ConvertExecBody(SequenceBodies[BranchIndex], Ctx, MutableBranchExecPin);
+				}
+			}
+
+			OutExecPin = nullptr;
+			return SequenceNode;
+		}
+
 		UEdGraphNode* First = nullptr;
 		UEdGraphPin* CurExec = nullptr;
-		for (int32 i = 1; i < Form->Num(); i++)
+		for (const FLispNodePtr& BodyPart : SequenceBodies)
 		{
 			UEdGraphPin* StmtOut = nullptr;
-			UEdGraphNode* SN = IMP_ConvertFormToNode(Form->Get(i), Ctx, StmtOut);
+			UEdGraphNode* SN = IMP_ConvertFormToNode(BodyPart, Ctx, StmtOut);
 			if (SN)
 			{
 				if (!First) First = SN;
@@ -5263,6 +5473,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		OutExecPin = CurExec;
 		return First;
 	}
+
 
 	// (branch cond :true body :false body)
 	if (FormName.Equals(TEXT("branch"), ESearchCase::IgnoreCase))
@@ -5694,7 +5905,8 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 	{
 		int32 OutputStartIndex = 2;
 		const FString ExitName = IMP_ExtractCompoundName(Form, 1, OutputStartIndex);
-		UK2Node_Tunnel* ExitTunnel = IMP_FindMacroExitTunnel(Ctx.Graph, ExitName);
+		UK2Node_Tunnel* ExitTunnel = IMP_FindReusableMacroExitTunnel(Form, Ctx.Graph, ExitName);
+
 		if (!ExitTunnel)
 		{
 			Ctx.Errors.Add(FString::Printf(TEXT("IMP: macro exit tunnel not found: %s"), *ExitName));
@@ -5702,7 +5914,14 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			return nullptr;
 		}
 
+		if (IMP_IsPendingReusableBodyNode(ExitTunnel, Ctx))
+		{
+			IMP_MarkReusableBodyNodeConsumed(ExitTunnel, Ctx);
+			Ctx.AdvancePosition();
+		}
+
 		for (int32 i = OutputStartIndex; i < Form->Num(); ++i)
+
 		{
 			if (!Form->Get(i)->IsKeyword())
 			{
@@ -5856,19 +6075,24 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		}
 	}
 
-
+	if (UEdGraphNode* OpaqueReusableNode = IMP_TryReuseOpaqueGenericBodyNode(Form, Ctx))
+	{
+		OutExecPin = IMP_GetExecOutput(OpaqueReusableNode);
+		return OpaqueReusableNode;
+	}
 
 	Ctx.Errors.Add(FString::Printf(TEXT("IMP: unhandled form: %s"), *FormName));
 
 	return nullptr;
 }
 
+
 // --- Convert exec body: single statement or (seq ...) ---
 static void IMP_ConvertExecBody(const FLispNodePtr& Body, FBPImportContext& Ctx, UEdGraphPin*& CurrentExecPin)
 {
 	if (!Body.IsValid() || Body->IsNil()) return;
 
-	if (Body->IsList() && Body->GetFormName().Equals(TEXT("seq"), ESearchCase::IgnoreCase))
+	if (BP_IsStructuralSeqWrapper(Body))
 	{
 		for (int32 i = 1; i < Body->Num(); i++)
 		{
@@ -5887,6 +6111,7 @@ static void IMP_ConvertExecBody(const FLispNodePtr& Body, FBPImportContext& Ctx,
 			if (UEdGraphPin* In = IMP_GetExecInput(SN)) IMP_Connect(CurrentExecPin, In, Ctx);
 		IMP_UpdateCurrentExecPin(SN, StmtOut, CurrentExecPin);
 	}
+
 
 }
 
@@ -6782,6 +7007,11 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 				}
 
 				UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(ExistingEntry);
+				const bool bReuseExistingFunctionBody = (Options.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph);
+				if (bReuseExistingFunctionBody)
+				{
+					IMP_PrepareExistingEventBodyForIncrementalReuse(ExistingEntry, Ctx);
+				}
 
 				int32 NameArgStartIndex = 2;
 				IMP_ExtractCompoundName(Form, 1, NameArgStartIndex);
@@ -6806,6 +7036,12 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 					}
 					IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
 				}
+
+				if (bReuseExistingFunctionBody)
+				{
+					IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+				}
+
 				if (Ctx.Errors.Num() > 0)
 				{
 					return IMP_FailFromContext(Ctx, TEXT("Import function form failed"));
@@ -6849,6 +7085,11 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 				}
 
 				UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(ExistingTunnel);
+				const bool bReuseExistingMacroBody = (Options.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph);
+				if (bReuseExistingMacroBody)
+				{
+					IMP_PrepareExistingEventBodyForIncrementalReuse(ExistingTunnel, Ctx);
+				}
 
 				int32 NameArgStartIndex = 2;
 				IMP_ExtractCompoundName(Form, 1, NameArgStartIndex);
@@ -6872,7 +7113,12 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 					}
 					IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
 				}
+				if (bReuseExistingMacroBody)
+				{
+					IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+				}
 				EventsCreated++;
+
 			}
 		}
 		else
@@ -6996,6 +7242,11 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		}
 
 		UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(ExistingEntry);
+		const bool bReuseExistingFunctionBody = (Options.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph);
+		if (bReuseExistingFunctionBody)
+		{
+			IMP_PrepareExistingEventBodyForIncrementalReuse(ExistingEntry, Ctx);
+		}
 
 		int32 BodyStart = 2;
 		for (int32 i = 2; i < TopExpr->Num(); i++)
@@ -7015,6 +7266,12 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 			}
 			IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
 		}
+
+		if (bReuseExistingFunctionBody)
+		{
+			IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+		}
+
 
 		for (UEdGraphNode* N : Graph->Nodes)
 			if (N) N->ReconstructNode();
@@ -7072,6 +7329,11 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		}
 
 		UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(ExistingTunnel);
+		const bool bReuseExistingMacroBody = (Options.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph);
+		if (bReuseExistingMacroBody)
+		{
+			IMP_PrepareExistingEventBodyForIncrementalReuse(ExistingTunnel, Ctx);
+		}
 
 		int32 BodyStart = 2;
 		for (int32 i = 2; i < TopExpr->Num(); i++)
@@ -7091,6 +7353,12 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 			}
 			IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
 		}
+
+		if (bReuseExistingMacroBody)
+		{
+			IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+		}
+
 
 		for (UEdGraphNode* N : Graph->Nodes)
 			if (N) N->ReconstructNode();
