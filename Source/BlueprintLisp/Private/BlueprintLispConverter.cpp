@@ -44,6 +44,8 @@
 #include "K2Node_ActorBoundEvent.h"
 #include "K2Node_MakeArray.h"
 #include "K2Node_GetArrayItem.h"
+#include "K2Node_BreakStruct.h"
+#include "K2Node_MakeStruct.h"
 #include "K2Node_FunctionTerminator.h"
 #include "K2Node_EnumEquality.h"
 #include "K2Node_EnumInequality.h"
@@ -235,6 +237,52 @@ static FLispNodePtr EXP_MakeNameAtom(const FString& Name)
 	return bNeedsQuoting ? FLispNode::MakeString(Name) : FLispNode::MakeSymbol(Name);
 }
 
+static FString EXP_StripGeneratedPinSuffixes(const FString& Name)
+{
+	FString Result = Name;
+	while (true)
+	{
+		int32 LastUnderscore = INDEX_NONE;
+		if (!Result.FindLastChar(TEXT('_'), LastUnderscore) || LastUnderscore <= 0)
+		{
+			break;
+		}
+
+		const FString Tail = Result.Mid(LastUnderscore + 1);
+		bool bAllDigits = !Tail.IsEmpty();
+		bool bAllHexDigits = Tail.Len() == 32;
+		for (const TCHAR Ch : Tail)
+		{
+			if (!FChar::IsDigit(Ch))
+			{
+				bAllDigits = false;
+			}
+			if (!FChar::IsHexDigit(Ch))
+			{
+				bAllHexDigits = false;
+			}
+		}
+
+		if (!bAllDigits && !bAllHexDigits)
+		{
+			break;
+		}
+
+		Result = Result.Left(LastUnderscore);
+	}
+
+	return Result;
+}
+
+static FString EXP_GetStablePinKeywordName(const UEdGraphPin* Pin)
+{
+	if (!Pin)
+	{
+		return TEXT("");
+	}
+
+	return EXP_StripGeneratedPinSuffixes(Pin->PinName.ToString()).ToLower();
+}
 
 static void EXP_AppendMacroOutputDeclaration(TArray<FLispNodePtr>& Args, UEdGraphPin* Pin)
 {
@@ -448,6 +496,31 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		return FLispNode::MakeList(Args);
 	}
 
+	if (UK2Node_BreakStruct* BreakStructNode = Cast<UK2Node_BreakStruct>(SourceNode))
+	{
+		if (Visited.Contains(SourceNode)) return FLispNode::MakeSymbol(TEXT("...circular..."));
+		Visited.Add(SourceNode);
+
+		TArray<FLispNodePtr> Args;
+		Args.Add(FLispNode::MakeSymbol(TEXT("break-struct")));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":struct")));
+		Args.Add(EXP_MakeNameAtom(BreakStructNode->StructType ? BreakStructNode->StructType->GetName() : BreakStructNode->GetNodeTitle(ENodeTitleType::ListView).ToString()));
+
+		for (UEdGraphPin* Pin : BreakStructNode->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Input) continue;
+			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+			Args.Add(FLispNode::MakeKeyword(TEXT(":value")));
+			Args.Add(ConvertPureExpressionToLisp(Pin, Graph, Visited));
+			break;
+		}
+
+		Args.Add(FLispNode::MakeKeyword(TEXT(":field")));
+		Args.Add(EXP_MakeNameAtom(SourcePin->PinName.ToString()));
+		Visited.Remove(SourceNode);
+		return FLispNode::MakeList(Args);
+	}
+
 	// Generic K2Node pure node (e.g. UK2Node_EnumEquality, UK2Node_EnumInequality, etc.)
 	// These derive from UK2Node but not UK2Node_CallFunction, yet they are pure and output values.
 	if (UK2Node* K2Node = Cast<UK2Node>(SourceNode))
@@ -544,10 +617,13 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 					if (Pin->Direction != EGPD_Input) continue;
 					if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
 					if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+					if (Pin->bHidden) continue;
 					FLispNodePtr Val = ConvertPureExpressionToLisp(Pin, Graph, Visited);
 					if (!Val->IsNil())
 					{
-						Args.Add(FLispNode::MakeKeyword(FString::Printf(TEXT(":%s"), *Pin->PinName.ToString().ToLower())));
+						const FString StablePinKeyword = EXP_GetStablePinKeywordName(Pin);
+						if (StablePinKeyword.IsEmpty()) continue;
+						Args.Add(FLispNode::MakeKeyword(FString::Printf(TEXT(":%s"), *StablePinKeyword)));
 						Args.Add(Val);
 					}
 				}
@@ -586,10 +662,13 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 			if (Pin->Direction != EGPD_Input) continue;
 			if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
 			if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+			if (Pin->bHidden) continue;
 			FLispNodePtr Val = ConvertPureExpressionToLisp(Pin, Graph, Visited);
 			if (!Val->IsNil())
 			{
-				Args.Add(FLispNode::MakeKeyword(FString::Printf(TEXT(":%s"), *Pin->PinName.ToString().ToLower())));
+				const FString StablePinKeyword = EXP_GetStablePinKeywordName(Pin);
+				if (StablePinKeyword.IsEmpty()) continue;
+				Args.Add(FLispNode::MakeKeyword(FString::Printf(TEXT(":%s"), *StablePinKeyword)));
 				Args.Add(Val);
 			}
 		}
@@ -1310,8 +1389,11 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportContext& Ctx, UEdGraphPin*& OutExecPin);
 static void IMP_ConvertExecBody(const FLispNodePtr& Body, FBPImportContext& Ctx, UEdGraphPin*& CurrentExecPin);
 static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPImportContext& Ctx);
+static bool IMP_Connect(UEdGraphPin* Src, UEdGraphPin* Dst, FBPImportContext& Ctx);
 static FString IMP_ExtractCallMacroName(const FLispNodePtr& Form, int32& OutArgStartIndex);
 static UK2Node_MacroInstance* IMP_CreateMacroInstanceNode(const FLispNodePtr& Form, FBPImportContext& Ctx, UEdGraphPin*& OutPreferredOutputPin);
+static bool IMP_ExtractBindingNameAndValueIndex(const FLispNodePtr& Form, int32 StartIndex, FString& OutName, int32& OutValueIndex);
+static UScriptStruct* IMP_FindStructByName(const FString& StructName, FBPImportContext& Ctx);
 
 
 
@@ -1442,17 +1524,33 @@ static bool IMP_TryCreateConnection(UEdGraph* Graph, UEdGraphPin* Src, UEdGraphP
 }
 
 // --- Pin helpers ---
+static FString IMP_NormalizePinLookupName(const FString& Name);
+static FString IMP_StripGeneratedPinSuffixes(const FString& Name);
+
 static UEdGraphPin* IMP_FindOutputPinByName(UEdGraphNode* N, const FString& Name)
 {
 	if (!N || Name.IsEmpty()) return nullptr;
+
 	const FString RequestedNoSpaces = Name.Replace(TEXT(" "), TEXT(""));
+	const FString RequestedNormalized = IMP_NormalizePinLookupName(Name);
+	const FString RequestedStripped = IMP_StripGeneratedPinSuffixes(Name);
+	const FString RequestedStrippedNoSpaces = RequestedStripped.Replace(TEXT(" "), TEXT(""));
+	const FString RequestedStrippedNormalized = IMP_NormalizePinLookupName(RequestedStripped);
+
 	for (UEdGraphPin* P : N->Pins)
 	{
 		if (!P || P->Direction != EGPD_Output) continue;
 		if (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
 		const FString PinName = P->PinName.ToString();
 		if (PinName.Equals(Name, ESearchCase::IgnoreCase)) return P;
-		if (!RequestedNoSpaces.IsEmpty() && PinName.Replace(TEXT(" "), TEXT("")).Equals(RequestedNoSpaces, ESearchCase::IgnoreCase)) return P;
+
+		const FString PinNoSpaces = PinName.Replace(TEXT(" "), TEXT(""));
+		if (!RequestedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase)) return P;
+		if (!RequestedStrippedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase)) return P;
+
+		const FString PinNormalized = IMP_NormalizePinLookupName(PinName);
+		if (!RequestedNormalized.IsEmpty() && PinNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase)) return P;
+		if (!RequestedStrippedNormalized.IsEmpty() && PinNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase)) return P;
 	}
 	return nullptr;
 }
@@ -1466,25 +1564,137 @@ static UEdGraphPin* IMP_FindOutputPin(UEdGraphNode* N, const FString& Name)
 	return nullptr;
 }
 
+static FString IMP_NormalizePinLookupName(const FString& Name)
+{
+	FString Normalized = Name.TrimStartAndEnd().ToLower();
+	Normalized.ReplaceInline(TEXT(" "), TEXT(""));
+	Normalized.ReplaceInline(TEXT("_"), TEXT(""));
+	Normalized.ReplaceInline(TEXT("-"), TEXT(""));
+	Normalized.ReplaceInline(TEXT("."), TEXT(""));
+	return Normalized;
+}
+
+static FString IMP_StripGeneratedPinSuffixes(const FString& Name)
+{
+	FString Result = Name;
+	while (true)
+	{
+		int32 LastUnderscore = INDEX_NONE;
+		if (!Result.FindLastChar(TEXT('_'), LastUnderscore) || LastUnderscore <= 0)
+		{
+			break;
+		}
+
+		const FString Tail = Result.Mid(LastUnderscore + 1);
+		bool bAllDigits = !Tail.IsEmpty();
+		bool bAllHexDigits = Tail.Len() == 32;
+		for (const TCHAR Ch : Tail)
+		{
+			if (!FChar::IsDigit(Ch))
+			{
+				bAllDigits = false;
+			}
+			if (!FChar::IsHexDigit(Ch))
+			{
+				bAllHexDigits = false;
+			}
+		}
+
+		if (!bAllDigits && !bAllHexDigits)
+		{
+			break;
+		}
+
+		Result = Result.Left(LastUnderscore);
+	}
+
+	return Result;
+}
+
 static UEdGraphPin* IMP_FindInputPin(UEdGraphNode* N, const FString& Name)
 {
 	if (!N || Name.IsEmpty()) return nullptr;
+
 	const FString RequestedNoSpaces = Name.Replace(TEXT(" "), TEXT(""));
-	for (UEdGraphPin* P : N->Pins)
+	const FString RequestedNormalized = IMP_NormalizePinLookupName(Name);
+	const FString RequestedStripped = IMP_StripGeneratedPinSuffixes(Name);
+	const FString RequestedStrippedNoSpaces = RequestedStripped.Replace(TEXT(" "), TEXT(""));
+	const FString RequestedStrippedNormalized = IMP_NormalizePinLookupName(RequestedStripped);
+
+	auto SearchExistingPins = [&]() -> UEdGraphPin*
 	{
-		if (!P || P->Direction != EGPD_Input) continue;
-		const FString PinName = P->PinName.ToString();
-		if (PinName.Equals(Name, ESearchCase::IgnoreCase))
+		for (UEdGraphPin* P : N->Pins)
 		{
-			return P;
+			if (!P || P->Direction != EGPD_Input) continue;
+			const FString PinName = P->PinName.ToString();
+			if (PinName.Equals(Name, ESearchCase::IgnoreCase))
+			{
+				return P;
+			}
+
+			const FString PinNoSpaces = PinName.Replace(TEXT(" "), TEXT(""));
+			if (!RequestedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase))
+			{
+				return P;
+			}
+			if (!RequestedStrippedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase))
+			{
+				return P;
+			}
+
+			const FString PinNormalized = IMP_NormalizePinLookupName(PinName);
+			if (!RequestedNormalized.IsEmpty() && PinNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+			{
+				return P;
+			}
+			if (!RequestedStrippedNormalized.IsEmpty() && PinNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+			{
+				return P;
+			}
 		}
-		if (!RequestedNoSpaces.IsEmpty() && PinName.Replace(TEXT(" "), TEXT("")).Equals(RequestedNoSpaces, ESearchCase::IgnoreCase))
+		return nullptr;
+	};
+
+	if (UEdGraphPin* DirectMatch = SearchExistingPins())
+	{
+		return DirectMatch;
+	}
+
+	const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(N->GetSchema());
+	bool bExpandedStructPin = false;
+	if (K2Schema)
+	{
+		for (UEdGraphPin* P : N->Pins)
 		{
-			return P;
+			if (!P || P->Direction != EGPD_Input) continue;
+			if (P->ParentPin != nullptr) continue;
+			if (P->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) continue;
+			if (P->SubPins.Num() > 0) continue;
+			if (!P->PinType.PinSubCategoryObject.IsValid()) continue;
+
+			const FString RootNormalized = IMP_NormalizePinLookupName(P->PinName.ToString());
+			if (RootNormalized.IsEmpty()) continue;
+
+			const bool bLooksLikeSplitChild = (RequestedNormalized.StartsWith(RootNormalized) && RequestedNormalized != RootNormalized)
+				|| (RequestedStrippedNormalized.StartsWith(RootNormalized) && RequestedStrippedNormalized != RootNormalized);
+			if (!bLooksLikeSplitChild)
+			{
+				continue;
+			}
+
+			K2Schema->SplitPin(P, false);
+			bExpandedStructPin = true;
 		}
 	}
+
+	if (bExpandedStructPin)
+	{
+		return SearchExistingPins();
+	}
+
 	return nullptr;
 }
+
 
 static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N)
 {
@@ -1592,6 +1802,63 @@ static void IMP_ApplyCallInputs(UK2Node_CallFunction* CallNode, const FLispNodeP
 		return nullptr;
 	};
 
+	TMap<FString, UK2Node_MakeStruct*> StructInputBuilders;
+	auto TryAssignStructMemberKeyword = [&Ctx, CallNode, &StructInputBuilders, &MarkAssigned](const FString& KeywordName, const FLispNodePtr& ValueNode) -> bool
+	{
+		const FString StableKeywordName = IMP_StripGeneratedPinSuffixes(KeywordName);
+		int32 FirstUnderscore = INDEX_NONE;
+		if (!StableKeywordName.FindChar(TEXT('_'), FirstUnderscore) || FirstUnderscore <= 0 || FirstUnderscore >= StableKeywordName.Len() - 1)
+		{
+			return false;
+		}
+
+		const FString RootPinName = StableKeywordName.Left(FirstUnderscore);
+		const FString MemberPinName = StableKeywordName.Mid(FirstUnderscore + 1);
+		UEdGraphPin* RootInputPin = IMP_FindInputPin(CallNode, RootPinName);
+		if (!RootInputPin || RootInputPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct)
+		{
+			return false;
+		}
+
+		UScriptStruct* StructType = Cast<UScriptStruct>(RootInputPin->PinType.PinSubCategoryObject.Get());
+		if (!StructType)
+		{
+			return false;
+		}
+
+		const FString BuilderKey = RootInputPin->PinName.ToString();
+		UK2Node_MakeStruct* MakeStructNode = StructInputBuilders.FindRef(BuilderKey);
+		if (!MakeStructNode)
+		{
+			MakeStructNode = NewObject<UK2Node_MakeStruct>(Ctx.Graph);
+			MakeStructNode->StructType = StructType;
+			MakeStructNode->NodePosX = Ctx.CurrentX;
+			MakeStructNode->NodePosY = Ctx.CurrentY;
+			Ctx.Graph->AddNode(MakeStructNode, false, false);
+			MakeStructNode->AllocateDefaultPins();
+			IMP_EnsureGuid(MakeStructNode);
+			Ctx.AdvancePosition();
+			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), MakeStructNode);
+			StructInputBuilders.Add(BuilderKey, MakeStructNode);
+
+			if (UEdGraphPin* StructOutputPin = IMP_FindOutputPin(MakeStructNode, TEXT("")))
+			{
+				IMP_Connect(StructOutputPin, RootInputPin, Ctx);
+			}
+		}
+
+		UEdGraphPin* MemberInputPin = IMP_FindInputPin(MakeStructNode, MemberPinName);
+		if (!MemberInputPin)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: make-struct input pin not found: %s.%s"), *StructType->GetName(), *MemberPinName));
+			return true;
+		}
+
+		IMP_SetPinFromExpr(MemberInputPin, ValueNode, Ctx);
+		MarkAssigned(RootInputPin);
+		return true;
+	};
+
 	for (; ArgIndex < Form->Num(); ++ArgIndex)
 	{
 		const FLispNodePtr ArgNode = Form->Get(ArgIndex);
@@ -1617,10 +1884,9 @@ static void IMP_ApplyCallInputs(UK2Node_CallFunction* CallNode, const FLispNodeP
 				IMP_SetPinFromExpr(InputPin, ValueNode, Ctx);
 				MarkAssigned(InputPin);
 			}
-			else
+			else if (!TryAssignStructMemberKeyword(KeywordName, ValueNode))
 			{
 				Ctx.Errors.Add(FString::Printf(TEXT("IMP: call input pin not found: %s.%s"), *CallNode->GetNodeTitle(ENodeTitleType::ListView).ToString(), *KeywordName));
-
 			}
 			continue;
 		}
@@ -1869,6 +2135,179 @@ static UEdGraphPin* IMP_SelectBestMacroOutputPinForDestination(UK2Node_MacroInst
 	return nullptr;
 }
 
+static UEdGraphPin* IMP_SelectBestDataOutputPinForDestination(UEdGraphNode* SourceNode, UEdGraphPin* DestinationPin, UEdGraph* Graph, const FString& PreferredOutputName = TEXT(""))
+{
+	if (!SourceNode || !DestinationPin)
+	{
+		return nullptr;
+	}
+
+	if (!PreferredOutputName.IsEmpty())
+	{
+		if (UEdGraphPin* PreferredPin = IMP_FindOutputPinByName(SourceNode, PreferredOutputName))
+		{
+			return PreferredPin;
+		}
+	}
+
+	TArray<UEdGraphPin*> CompatiblePins;
+	for (UEdGraphPin* Candidate : SourceNode->Pins)
+	{
+		if (!Candidate || Candidate->Direction != EGPD_Output) continue;
+		if (Candidate->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+		if (Candidate->bHidden) continue;
+		if (IMP_CanPinsConnectWithoutMutation(Graph, Candidate, DestinationPin))
+		{
+			CompatiblePins.Add(Candidate);
+		}
+	}
+
+	if (CompatiblePins.Num() == 1)
+	{
+		return CompatiblePins[0];
+	}
+
+	const FString DestinationName = DestinationPin->PinName.ToString();
+	const FString DestinationNoSpaces = DestinationName.Replace(TEXT(" "), TEXT(""));
+	const FString DestinationNormalized = IMP_NormalizePinLookupName(DestinationName);
+	const FString DestinationWithoutLeadingIn = DestinationNormalized.StartsWith(TEXT("in")) ? DestinationNormalized.Mid(2) : DestinationNormalized;
+	for (UEdGraphPin* Candidate : CompatiblePins)
+	{
+		const FString CandidateName = Candidate->PinName.ToString();
+		const FString CandidateNoSpaces = CandidateName.Replace(TEXT(" "), TEXT(""));
+		const FString CandidateNormalized = IMP_NormalizePinLookupName(CandidateName);
+		if (CandidateName.Equals(DestinationName, ESearchCase::IgnoreCase))
+		{
+			return Candidate;
+		}
+		if (!DestinationNoSpaces.IsEmpty() && CandidateNoSpaces.Equals(DestinationNoSpaces, ESearchCase::IgnoreCase))
+		{
+			return Candidate;
+		}
+		if (!DestinationNormalized.IsEmpty() && CandidateNormalized.Equals(DestinationNormalized, ESearchCase::IgnoreCase))
+		{
+			return Candidate;
+		}
+		if (!DestinationWithoutLeadingIn.IsEmpty() && CandidateNormalized.Equals(DestinationWithoutLeadingIn, ESearchCase::IgnoreCase))
+		{
+			return Candidate;
+		}
+		if (!DestinationWithoutLeadingIn.IsEmpty() && (DestinationWithoutLeadingIn.Contains(CandidateNormalized) || CandidateNormalized.Contains(DestinationWithoutLeadingIn)))
+		{
+			return Candidate;
+		}
+		if (!DestinationNormalized.IsEmpty() && (DestinationNormalized.Contains(CandidateNormalized) || CandidateNormalized.Contains(DestinationNormalized)))
+		{
+			return Candidate;
+		}
+	}
+
+	return nullptr;
+}
+
+static UEdGraphPin* IMP_TryBuildBreakStructOutputPin(const FLispNodePtr& Expr, UEdGraphPin* DestinationPin, FBPImportContext& Ctx, bool& bHandled)
+{
+	bHandled = false;
+	if (!Expr.IsValid() || !Expr->IsList() || Expr->Num() == 0 || !DestinationPin)
+	{
+		return nullptr;
+	}
+
+	FString StructTypeName;
+	FString PreferredFieldName;
+	FLispNodePtr ValueExpr = FLispNode::MakeNil();
+
+	if (Expr->IsForm(TEXT("break-struct")))
+	{
+		bHandled = true;
+		const FLispNodePtr StructNode = Expr->GetKeywordArg(TEXT(":struct"));
+		ValueExpr = Expr->GetKeywordArg(TEXT(":value"));
+		const FLispNodePtr FieldNode = Expr->GetKeywordArg(TEXT(":field"));
+		if (StructNode.IsValid() && (StructNode->IsString() || StructNode->IsSymbol()))
+		{
+			StructTypeName = StructNode->StringValue;
+		}
+		if (FieldNode.IsValid() && (FieldNode->IsString() || FieldNode->IsSymbol()))
+		{
+			PreferredFieldName = FieldNode->StringValue;
+		}
+	}
+	else
+	{
+		FString LegacyBreakName;
+		int32 ValueIndex = INDEX_NONE;
+		if (!IMP_ExtractBindingNameAndValueIndex(Expr, 0, LegacyBreakName, ValueIndex)
+			|| !LegacyBreakName.StartsWith(TEXT("Break "), ESearchCase::IgnoreCase)
+			|| ValueIndex <= 0
+			|| ValueIndex >= Expr->Num())
+		{
+			return nullptr;
+		}
+
+		bHandled = true;
+		StructTypeName = LegacyBreakName.Mid(6).TrimStartAndEnd();
+		ValueExpr = Expr->Get(ValueIndex);
+	}
+
+	if (StructTypeName.IsEmpty() || !ValueExpr.IsValid() || ValueExpr->IsNil())
+	{
+		Ctx.Errors.Add(TEXT("IMP: break-struct expression is missing struct type or source value"));
+		return nullptr;
+	}
+
+	UScriptStruct* StructType = IMP_FindStructByName(StructTypeName, Ctx);
+	if (!StructType)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: break-struct struct type not found: %s"), *StructTypeName));
+		return nullptr;
+	}
+
+	UK2Node_BreakStruct* BreakNode = NewObject<UK2Node_BreakStruct>(Ctx.Graph);
+	BreakNode->StructType = StructType;
+	BreakNode->NodePosX = Ctx.CurrentX;
+	BreakNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(BreakNode, false, false);
+	BreakNode->AllocateDefaultPins();
+	IMP_EnsureGuid(BreakNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), BreakNode);
+
+	UEdGraphPin* StructInputPin = nullptr;
+	for (UEdGraphPin* Candidate : BreakNode->Pins)
+	{
+		if (!Candidate || Candidate->Direction != EGPD_Input) continue;
+		if (Candidate->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+		StructInputPin = Candidate;
+		break;
+	}
+
+	if (!StructInputPin)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: break-struct input pin missing for %s"), *StructTypeName));
+		return nullptr;
+	}
+
+	if (!IMP_SetPinFromExpr(StructInputPin, ValueExpr, Ctx))
+	{
+		return nullptr;
+	}
+
+	UEdGraphPin* SelectedOutputPin = IMP_SelectBestDataOutputPinForDestination(BreakNode, DestinationPin, Ctx.Graph, PreferredFieldName);
+	if (!SelectedOutputPin)
+	{
+		const FString OwnerNodeTitle = DestinationPin->GetOwningNode() ? DestinationPin->GetOwningNode()->GetNodeTitle(ENodeTitleType::ListView).ToString() : TEXT("<null node>");
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: break-struct '%s' has no output compatible with pin %s.%s"),
+			*StructTypeName,
+			*OwnerNodeTitle,
+			*DestinationPin->PinName.ToString()));
+		return nullptr;
+	}
+
+	IMP_RegisterBoundValue(SelectedOutputPin->PinName.ToString(), SelectedOutputPin, Ctx);
+	return SelectedOutputPin;
+}
+
 // Set a pin's default value from a Lisp expression (number, string, bool, or connected expr)
 static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPImportContext& Ctx)
 
@@ -1909,6 +2348,16 @@ static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPIm
 				return IMP_Connect(SelectedOutputPin, Pin, Ctx);
 			}
 		}
+	}
+
+	bool bHandledBreakStructExpr = false;
+	if (UEdGraphPin* BreakStructOutputPin = IMP_TryBuildBreakStructOutputPin(Expr, Pin, Ctx, bHandledBreakStructExpr))
+	{
+		return IMP_Connect(BreakStructOutputPin, Pin, Ctx);
+	}
+	if (bHandledBreakStructExpr)
+	{
+		return false;
 	}
 
 	UEdGraphPin* Src = IMP_ResolveLispExpr(Expr, Ctx);
@@ -2060,6 +2509,41 @@ static UFunction* IMP_FindParentFunction(const FString& FuncName, FBPImportConte
 
 	return nullptr;
 }
+
+static UFunction* IMP_FindImplementedInterfaceFunction(const FString& FuncName, FBPImportContext& Ctx)
+{
+	if (!Ctx.Blueprint)
+	{
+		return nullptr;
+	}
+
+	TArray<FString> Names = { FuncName, TEXT("K2_") + FuncName };
+	if (FuncName.StartsWith(TEXT("K2_")))
+	{
+		Names.Add(FuncName.Mid(3));
+	}
+
+	for (const FBPInterfaceDescription& Desc : Ctx.Blueprint->ImplementedInterfaces)
+	{
+		UClass* InterfaceClass = Desc.Interface;
+		if (!InterfaceClass)
+		{
+			continue;
+		}
+
+		for (const FString& CandidateName : Names)
+		{
+			if (UFunction* Func = InterfaceClass->FindFunctionByName(*CandidateName))
+			{
+				return Func;
+			}
+		}
+
+	}
+
+	return nullptr;
+}
+
 
 static UEdGraph* IMP_FindMacroGraphByName(const FString& MacroName, FBPImportContext& Ctx)
 {
@@ -2349,6 +2833,11 @@ static UEdGraphPin* IMP_ConfigureMacroInstanceNode(UK2Node_MacroInstance* MacroN
 			i += 1;
 			continue;
 		}
+		if (IMP_ShouldIgnoreCallKeyword(KeywordName) || KeywordName.Equals(TEXT("event-id"), ESearchCase::IgnoreCase))
+		{
+			i += 1;
+			continue;
+		}
 
 		if (UEdGraphPin* InputPin = IMP_FindInputPin(MacroNode, KeywordName))
 		{
@@ -2474,7 +2963,41 @@ static UClass* IMP_FindClassByName(const FString& TypeName, FBPImportContext& Ct
 	return nullptr;
 }
 
+static UScriptStruct* IMP_FindStructByName(const FString& StructName, FBPImportContext& Ctx)
+{
+	if (StructName.IsEmpty()) return nullptr;
+
+	auto MatchesStruct = [&StructName](UScriptStruct* InStruct) -> bool
+	{
+		if (!InStruct) return false;
+		return InStruct->GetName().Equals(StructName, ESearchCase::IgnoreCase)
+			|| InStruct->GetStructCPPName().Equals(StructName, ESearchCase::IgnoreCase);
+	};
+
+	if (StructName.Contains(TEXT("/")) || StructName.Contains(TEXT(".")))
+	{
+		if (UScriptStruct* LoadedStruct = LoadObject<UScriptStruct>(nullptr, *StructName))
+		{
+			return LoadedStruct;
+		}
+	}
+
+
+
+
+	for (TObjectIterator<UScriptStruct> It; It; ++It)
+	{
+		if (MatchesStruct(*It))
+		{
+			return *It;
+		}
+	}
+
+	return nullptr;
+}
+
 static UEnum* IMP_FindEnumByName(const FString& EnumName)
+
 {
 	if (EnumName.IsEmpty()) return nullptr;
 
@@ -2562,6 +3085,13 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 		return true;
 	}
 
+	if (UScriptStruct* ResolvedStruct = IMP_FindStructByName(Normalized, Ctx))
+	{
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+		OutPinType.PinSubCategoryObject = ResolvedStruct;
+		return true;
+	}
+
 	if (UClass* ResolvedClass = IMP_FindClassByName(Normalized, Ctx))
 	{
 		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Object;
@@ -2571,6 +3101,7 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 
 	return false;
 }
+
 
 static void IMP_EnsureFunctionEntryParamsFromFunctionForm(UK2Node_FunctionEntry* ExistingEntry, const FLispNodePtr& Form, FBPImportContext& Ctx)
 {
@@ -3323,27 +3854,62 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 	}
 
 	// Generic function call / pure expr: (FuncName [self] [:pin value]...)
-	if (!FormName.IsEmpty())
+	int32 CompoundArgStartIndex = 1;
+	const FString CompoundFormName = IMP_ExtractCompoundName(Expr, 0, CompoundArgStartIndex);
+	if (Expr->Num() == 1 && CompoundFormName.StartsWith(TEXT("self."), ESearchCase::IgnoreCase))
 	{
-		if (UFunction* F = IMP_FindFunction(FormName, Ctx))
-		{
-			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN);
-			IMP_ApplyCallInputs(CN, Expr, 1, true, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
-			return IMP_FindOutputPin(CN, TEXT("ReturnValue"));
-		}
-
-		// Try variable get with same name as form
-
+		const FString MemberName = CompoundFormName.Mid(5);
 		UK2Node_VariableGet* VarGet = NewObject<UK2Node_VariableGet>(Ctx.Graph);
-		VarGet->VariableReference.SetSelfMember(FName(*FormName));
+		VarGet->VariableReference.SetSelfMember(FName(*MemberName));
 		VarGet->NodePosX = Ctx.CurrentX; VarGet->NodePosY = Ctx.CurrentY;
 		Ctx.Graph->AddNode(VarGet, false, false); VarGet->AllocateDefaultPins(); IMP_EnsureGuid(VarGet);
 		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), VarGet);
 		return IMP_FindOutputPin(VarGet, TEXT(""));
 	}
+
+	FString CompoundBindingName;
+	int32 CompoundBindingValueIndex = INDEX_NONE;
+	if (IMP_ExtractBindingNameAndValueIndex(Expr, 0, CompoundBindingName, CompoundBindingValueIndex))
+	{
+		if (UFunction* CompoundFunc = IMP_FindFunction(CompoundBindingName, Ctx))
+		{
+			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+			CN->SetFromFunction(CompoundFunc); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
+			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN);
+			IMP_ApplyCallInputs(CN, Expr, CompoundBindingValueIndex, true, Ctx);
+			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
+			return IMP_FindOutputPin(CN, TEXT("ReturnValue"));
+		}
+
+		if (Expr->Num() == 2 && CompoundBindingValueIndex == 1)
+		{
+			return IMP_ResolveLispExpr(Expr->Get(1), Ctx);
+		}
+	}
+
+	const FString PrimaryFormName = !CompoundFormName.IsEmpty() ? CompoundFormName : FormName;
+	const int32 PrimaryArgStartIndex = !CompoundFormName.IsEmpty() ? CompoundArgStartIndex : 1;
+	if (!PrimaryFormName.IsEmpty())
+	{
+		if (UFunction* F = IMP_FindFunction(PrimaryFormName, Ctx))
+		{
+			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
+			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN);
+			IMP_ApplyCallInputs(CN, Expr, PrimaryArgStartIndex, true, Ctx);
+			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
+			return IMP_FindOutputPin(CN, TEXT("ReturnValue"));
+		}
+
+		// Try variable get with same name as form
+		UK2Node_VariableGet* VarGet = NewObject<UK2Node_VariableGet>(Ctx.Graph);
+		VarGet->VariableReference.SetSelfMember(FName(*PrimaryFormName));
+		VarGet->NodePosX = Ctx.CurrentX; VarGet->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(VarGet, false, false); VarGet->AllocateDefaultPins(); IMP_EnsureGuid(VarGet);
+		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), VarGet);
+		return IMP_FindOutputPin(VarGet, TEXT(""));
+	}
+
 
 
 	return nullptr;
@@ -3437,10 +4003,17 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		Ctx.AdvancePosition();
 		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CastNode);
 
+		if (UEdGraphPin* CastResultPin = CastNode->GetCastResultPin())
+		{
+			IMP_RegisterBoundValue(TEXT("K2Node_DynamicCast"), CastResultPin, Ctx);
+			IMP_RegisterBoundValue(CastResultPin->PinName.ToString(), CastResultPin, Ctx);
+		}
+
 		if (UEdGraphPin* SourcePin = CastNode->GetCastSourcePin())
 		{
 			IMP_SetPinFromExpr(SourcePin, Form->Get(2), Ctx);
 		}
+
 
 		FLispNodePtr SuccessBody = (Form->Num() >= 4 && !Form->Get(3)->IsKeyword()) ? Form->Get(3) : FLispNode::MakeNil();
 		FLispNodePtr FailBody = Form->GetKeywordArg(TEXT(":fail"));
@@ -4040,15 +4613,16 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 
 	UK2Node_Event* EventNode = nullptr;
 
-	// Override or custom event?
-	UFunction* OverrideFunc = Ctx.Blueprint && Ctx.Blueprint->ParentClass
-		? Ctx.Blueprint->ParentClass->FindFunctionByName(*EventName) : nullptr;
+	// Override / interface event / custom event?
+	UFunction* OverrideFunc = IMP_FindParentFunction(EventName, Ctx);
+	UFunction* InterfaceFunc = OverrideFunc ? nullptr : IMP_FindImplementedInterfaceFunction(EventName, Ctx);
+	UFunction* EventSignatureFunc = OverrideFunc ? OverrideFunc : InterfaceFunc;
 
-	if (OverrideFunc)
+	if (EventSignatureFunc)
 	{
 		EventNode = NewObject<UK2Node_Event>(Ctx.Graph);
-		EventNode->EventReference.SetFromField<UFunction>(OverrideFunc, false);
-		EventNode->bOverrideFunction = true;
+		EventNode->EventReference.SetFromField<UFunction>(EventSignatureFunc, false);
+		EventNode->bOverrideFunction = (OverrideFunc != nullptr);
 	}
 	else
 	{
@@ -4057,24 +4631,84 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 		EventNode = CE;
 	}
 
+
 	EventNode->NodePosX = Ctx.CurrentX; EventNode->NodePosY = Ctx.CurrentY;
 	Ctx.Graph->AddNode(EventNode, false, false);
 	EventNode->AllocateDefaultPins(); IMP_EnsureGuid(EventNode);
 	Ctx.AdvancePosition();
 
-	FString EventGuid = EventNode->NodeGuid.ToString();
-	Ctx.TempIdToNode.Add(EventGuid, EventNode);
-
-	// Register output pins as variables
-	for (UEdGraphPin* P : EventNode->Pins)
+	if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(EventNode))
 	{
-		if (P->Direction != EGPD_Output || P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || P->bHidden) continue;
-		FString PinName = P->PinName.ToString();
-		Ctx.VariableToNodeId.Add(PinName, EventGuid);
-		Ctx.VariableToPin.Add(PinName, PinName);
-		FString NoSpaces = PinName.Replace(TEXT(" "), TEXT(""));
-		if (NoSpaces != PinName) { Ctx.VariableToNodeId.Add(NoSpaces, EventGuid); Ctx.VariableToPin.Add(NoSpaces, PinName); }
+		bool bChangedParams = false;
+		for (int32 i = ArgStartIndex; i + 1 < EventForm->Num(); ++i)
+		{
+			const FLispNodePtr KeywordNode = EventForm->Get(i);
+			if (!KeywordNode.IsValid() || !KeywordNode->IsKeyword())
+			{
+				break;
+			}
+
+			const FString Keyword = KeywordNode->StringValue;
+			const FLispNodePtr ValueNode = EventForm->Get(i + 1);
+			if (Keyword.Equals(TEXT(":param"), ESearchCase::IgnoreCase))
+			{
+				FString ParamName;
+				FString ParamType;
+				if (!IMP_TryExtractNamedTypedPair(ValueNode, ParamName, ParamType))
+				{
+					Ctx.Errors.Add(TEXT("Import event form failed: invalid :param declaration"));
+					i += 1;
+					continue;
+				}
+
+				bool bAlreadyExists = false;
+				for (UEdGraphPin* ExistingPin : CustomEventNode->Pins)
+				{
+					if (!ExistingPin || ExistingPin->Direction != EGPD_Output || ExistingPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || ExistingPin->bHidden)
+					{
+						continue;
+					}
+					if (ExistingPin->PinName.ToString().Equals(ParamName, ESearchCase::IgnoreCase))
+					{
+						bAlreadyExists = true;
+						break;
+					}
+				}
+				if (bAlreadyExists)
+				{
+					i += 1;
+					continue;
+				}
+
+				FEdGraphPinType ParamPinType;
+				if (!IMP_BuildPinTypeFromLispType(ParamType, ParamPinType, Ctx))
+				{
+					Ctx.Errors.Add(FString::Printf(TEXT("Import event form failed: unsupported parameter type '%s'"), *ParamType));
+					i += 1;
+					continue;
+				}
+
+				if (!CustomEventNode->CreateUserDefinedPin(FName(*ParamName), ParamPinType, EGPD_Output, false))
+				{
+					Ctx.Errors.Add(FString::Printf(TEXT("Import event form failed: could not create parameter '%s'"), *ParamName));
+					i += 1;
+					continue;
+				}
+				bChangedParams = true;
+			}
+
+			i += 1;
+		}
+
+		if (bChangedParams)
+		{
+			CustomEventNode->ReconstructNode();
+		}
 	}
+
+	const FString EventGuid = EventNode->NodeGuid.ToString();
+	Ctx.TempIdToNode.Add(EventGuid, EventNode);
+	IMP_RegisterEventOutputPins(EventNode, Ctx);
 
 	UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(EventNode);
 
