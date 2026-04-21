@@ -1867,8 +1867,84 @@ static UK2Node_DynamicCast* IMP_CreateOrReuseDynamicCastNode(const FLispNodePtr&
 	return DynamicCastNode;
 }
 
+static bool IMP_IsCompatibleExistingSwitchIntegerNode(UK2Node_SwitchInteger* SwitchNode, const TArray<TPair<int32, FLispNodePtr>>& RequestedCaseBodies, bool bRequestedHasDefaultPin)
+{
+	if (!SwitchNode)
+	{
+		return false;
+	}
+
+	if ((SwitchNode->GetDefaultPin() != nullptr) != bRequestedHasDefaultPin)
+	{
+		return false;
+	}
+
+	TArray<int32> ExistingCaseLabels;
+	for (UEdGraphPin* Pin : SwitchNode->Pins)
+	{
+		if (Pin
+			&& Pin->Direction == EGPD_Output
+			&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
+			&& !Pin->PinName.ToString().Equals(TEXT("default"), ESearchCase::IgnoreCase))
+		{
+			ExistingCaseLabels.Add(FCString::Atoi(*Pin->PinName.ToString()));
+		}
+	}
+
+	ExistingCaseLabels.Sort();
+
+	if (ExistingCaseLabels.Num() != RequestedCaseBodies.Num())
+	{
+		return false;
+	}
+
+	for (int32 CaseIdx = 0; CaseIdx < RequestedCaseBodies.Num(); ++CaseIdx)
+	{
+		if (ExistingCaseLabels[CaseIdx] != RequestedCaseBodies[CaseIdx].Key)
+		{
+			return false;
+		}
+	}
+
+	return true;
+}
+
+static UK2Node_SwitchInteger* IMP_CreateOrReuseSwitchIntegerNode(const FLispNodePtr& Form, const TArray<TPair<int32, FLispNodePtr>>& CaseBodies, bool bHasDefaultPin, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_SwitchInteger* ReusableSwitchNode = Cast<UK2Node_SwitchInteger>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingSwitchIntegerNode(ReusableSwitchNode, CaseBodies, bHasDefaultPin))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableSwitchNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableSwitchNode;
+			}
+		}
+	}
+
+	UK2Node_SwitchInteger* SwitchNode = NewObject<UK2Node_SwitchInteger>(Ctx.Graph);
+	SwitchNode->StartIndex = CaseBodies.Num() > 0 ? CaseBodies[0].Key : 0;
+	SwitchNode->bHasDefaultPin = bHasDefaultPin;
+	SwitchNode->NodePosX = Ctx.CurrentX;
+	SwitchNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(SwitchNode, false, false);
+	SwitchNode->AllocateDefaultPins();
+	for (int32 CaseIdx = 0; CaseIdx < CaseBodies.Num(); ++CaseIdx)
+	{
+		SwitchNode->AddPinToSwitchNode();
+	}
+	IMP_EnsureGuid(SwitchNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), SwitchNode);
+	Ctx.TempIdToNode.Add(SwitchNode->NodeGuid.ToString(), SwitchNode);
+	return SwitchNode;
+}
+
 static FString IMP_GetExistingCallNodeName(UK2Node_CallFunction* CallNode)
 {
+
 
 
 	if (!CallNode)
@@ -4877,6 +4953,11 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 				i += 1;
 				continue;
 			}
+			if (Keyword.Equals(TEXT(":id"), ESearchCase::IgnoreCase))
+			{
+				i += 1;
+				continue;
+			}
 
 			const FString CaseName = Keyword.StartsWith(TEXT(":")) ? Keyword.Mid(1) : Keyword;
 			CaseBodies.Emplace(FCString::Atoi(*CaseName), (i + 1 < Form->Num()) ? Form->Get(i + 1) : FLispNode::MakeNil());
@@ -4884,22 +4965,11 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		}
 		CaseBodies.Sort([](const TPair<int32, FLispNodePtr>& A, const TPair<int32, FLispNodePtr>& B) { return A.Key < B.Key; });
 
-		UK2Node_SwitchInteger* SwitchNode = NewObject<UK2Node_SwitchInteger>(Ctx.Graph);
-		SwitchNode->StartIndex = CaseBodies.Num() > 0 ? CaseBodies[0].Key : 0;
-		SwitchNode->bHasDefaultPin = DefaultBody.IsValid() && !DefaultBody->IsNil();
-		SwitchNode->NodePosX = Ctx.CurrentX;
-		SwitchNode->NodePosY = Ctx.CurrentY;
-		Ctx.Graph->AddNode(SwitchNode, false, false);
-		SwitchNode->AllocateDefaultPins();
-		for (int32 CaseIdx = 0; CaseIdx < CaseBodies.Num(); ++CaseIdx)
-		{
-			SwitchNode->AddPinToSwitchNode();
-		}
-		IMP_EnsureGuid(SwitchNode);
-		Ctx.AdvancePosition();
-		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), SwitchNode);
+		const bool bHasDefaultBody = DefaultBody.IsValid() && !DefaultBody->IsNil();
+		UK2Node_SwitchInteger* SwitchNode = IMP_CreateOrReuseSwitchIntegerNode(Form, CaseBodies, bHasDefaultBody, Ctx);
 
 		for (int32 CaseIdx = 1; CaseIdx < CaseBodies.Num(); ++CaseIdx)
+
 		{
 			if (CaseBodies[CaseIdx].Key != CaseBodies[0].Key + CaseIdx)
 			{

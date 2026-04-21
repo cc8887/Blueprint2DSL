@@ -126,7 +126,19 @@
       "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CastReuseProbe :: EventGraph",
       "issue": "dynamic cast 导出已带 :id，但 importer 过去没有目标类兼容检查与复用入口，update 时 cast 节点会漂移。",
       "notes": "当前 probe 只检查 impure cast 主路径与 success body 的复用；要求 cast 的 :id 在 update 前后保持不变。"
+    },
+    {
+      "id": "incremental_switch_int_reuse",
+      "script_path": "incremental_switch_int_reuse_probe.py",
+      "result_path": "incremental_switch_int_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_SwitchIntReuseProbe :: EventGraph",
+      "issue": "switch-int 导出已带 :id，但 importer 过去仍直接新建 UK2Node_SwitchInteger，导致 update 时节点 identity 漂移。",
+      "notes": "当前 probe 固定 case 标签，只要求 switch-int 的 :id 在 update 前后保持不变，且 selection 与 default 分支文本都更新成功。"
+
     }
   ]
 }
+
 
