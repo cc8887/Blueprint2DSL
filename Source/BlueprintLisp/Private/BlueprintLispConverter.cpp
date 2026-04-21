@@ -2018,7 +2018,49 @@ static UK2Node_CallFunction* IMP_CreateOrReuseCallFunctionNode(const FLispNodePt
 	return CallNode;
 }
 
+static bool IMP_IsCompatibleExistingCallParentNode(UK2Node_CallParentFunction* CallParentNode, const FString& RequestedFunctionName)
+{
+	if (!CallParentNode)
+	{
+		return false;
+	}
+
+	return IMP_GetExistingCallNodeName(CallParentNode).Equals(RequestedFunctionName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_CallParentFunction* IMP_CreateOrReuseCallParentNode(const FLispNodePtr& Form, UFunction* Function, const FString& RequestedFunctionName, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_CallParentFunction* ReusableCallParentNode = Cast<UK2Node_CallParentFunction>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingCallParentNode(ReusableCallParentNode, RequestedFunctionName))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableCallParentNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableCallParentNode;
+			}
+		}
+	}
+
+	UK2Node_CallParentFunction* CallParentNode = NewObject<UK2Node_CallParentFunction>(Ctx.Graph);
+	if (Function)
+	{
+		CallParentNode->SetFromFunction(Function);
+	}
+	CallParentNode->NodePosX = Ctx.CurrentX;
+	CallParentNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(CallParentNode, false, false);
+	CallParentNode->AllocateDefaultPins();
+	IMP_EnsureGuid(CallParentNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CallParentNode);
+	Ctx.TempIdToNode.Add(CallParentNode->NodeGuid.ToString(), CallParentNode);
+	return CallParentNode;
+}
+
 static FString IMP_GetMacroInstanceName(UK2Node_MacroInstance* MacroNode)
+
 {
 	if (!MacroNode)
 	{
@@ -5368,14 +5410,12 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		const FString FuncName = IMP_ExtractCompoundName(Form, 1, ArgStartIndex);
 		if (UFunction* F = IMP_FindParentFunction(FuncName, Ctx))
 		{
-			UK2Node_CallParentFunction* CN = NewObject<UK2Node_CallParentFunction>(Ctx.Graph);
-			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN); Ctx.AdvancePosition();
+			UK2Node_CallParentFunction* CN = IMP_CreateOrReuseCallParentNode(Form, F, FuncName, Ctx);
 			IMP_ApplyCallInputs(CN, Form, ArgStartIndex, false, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 			OutExecPin = IMP_GetExecOutput(CN);
 			return CN;
 		}
+
 
 		Ctx.Errors.Add(FString::Printf(TEXT("IMP: parent function not found: %s"), *FuncName));
 		return nullptr;

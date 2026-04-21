@@ -35,8 +35,9 @@ python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 如果只想跑某一组 case，可以临时设置环境变量 `BLUEPRINTLISP_CASE_FILTER`，值为逗号分隔的 case id 列表。例如只跑新增的增量 EventGraph probe：
 
 ```powershell
-$env:BLUEPRINTLISP_CASE_FILTER = "incremental_root_event_reuse,incremental_call_reuse,incremental_call_macro_reuse,incremental_set_branch_reuse,incremental_cast_reuse,incremental_switch_int_reuse"
+$env:BLUEPRINTLISP_CASE_FILTER = "incremental_root_event_reuse,incremental_call_reuse,incremental_call_macro_reuse,incremental_set_branch_reuse,incremental_cast_reuse,incremental_switch_int_reuse,incremental_call_parent_reuse"
 python .\Tests\Regression\run_blueprintlisp_regression_suite.py
+
 
 ```
 

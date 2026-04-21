@@ -136,9 +136,19 @@
       "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_SwitchIntReuseProbe :: EventGraph",
       "issue": "switch-int 导出已带 :id，但 importer 过去仍直接新建 UK2Node_SwitchInteger，导致 update 时节点 identity 漂移。",
       "notes": "当前 probe 固定 case 标签，只要求 switch-int 的 :id 在 update 前后保持不变，且 selection 与 default 分支文本都更新成功。"
-
+    },
+    {
+      "id": "incremental_call_parent_reuse",
+      "script_path": "incremental_call_parent_reuse_probe.py",
+      "result_path": "incremental_call_parent_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CallParentReuseProbe :: EventGraph",
+      "issue": "call-parent 导出已带 :id，但 importer 过去仍直接新建 UK2Node_CallParentFunction，导致 update 时父类调用节点 identity 漂移。",
+      "notes": "最小 probe 在 BlueprintInitializeAnimation 上调用 call-parent，要求 call-parent 的 :id 在 update 前后保持不变。"
     }
   ]
 }
+
 
 
