@@ -1527,6 +1527,97 @@ static bool IMP_TryCreateConnection(UEdGraph* Graph, UEdGraphPin* Src, UEdGraphP
 static FString IMP_NormalizePinLookupName(const FString& Name);
 static FString IMP_StripGeneratedPinSuffixes(const FString& Name);
 
+static bool IMP_DoesPinNameMatchLookup(
+	const FString& CandidateName,
+	const FString& RequestedName,
+	const FString& RequestedNoSpaces,
+	const FString& RequestedNormalized,
+	const FString& RequestedStrippedNoSpaces,
+	const FString& RequestedStrippedNormalized)
+{
+	if (CandidateName.Equals(RequestedName, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	const FString CandidateNoSpaces = CandidateName.Replace(TEXT(" "), TEXT(""));
+	if (!RequestedNoSpaces.IsEmpty() && CandidateNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	if (!RequestedStrippedNoSpaces.IsEmpty() && CandidateNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	const FString CandidateNormalized = IMP_NormalizePinLookupName(CandidateName);
+	if (!RequestedNormalized.IsEmpty() && CandidateNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	if (!RequestedStrippedNormalized.IsEmpty() && CandidateNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	const FString CandidateWithoutLeadingIn = CandidateNormalized.StartsWith(TEXT("in")) ? CandidateNormalized.Mid(2) : CandidateNormalized;
+	const FString RequestedWithoutLeadingIn = RequestedNormalized.StartsWith(TEXT("in")) ? RequestedNormalized.Mid(2) : RequestedNormalized;
+	const FString RequestedStrippedWithoutLeadingIn = RequestedStrippedNormalized.StartsWith(TEXT("in")) ? RequestedStrippedNormalized.Mid(2) : RequestedStrippedNormalized;
+	if (!RequestedWithoutLeadingIn.IsEmpty() && CandidateNormalized.Equals(RequestedWithoutLeadingIn, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	if (!RequestedStrippedWithoutLeadingIn.IsEmpty() && CandidateNormalized.Equals(RequestedStrippedWithoutLeadingIn, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	if (!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+	if (!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+	{
+		return true;
+	}
+
+	return false;
+}
+
+static UEdGraphPin* IMP_FindPinByNameRecursive(
+	const TArray<UEdGraphPin*>& Pins,
+	EEdGraphPinDirection Direction,
+	const FString& RequestedName,
+	const FString& RequestedNoSpaces,
+	const FString& RequestedNormalized,
+	const FString& RequestedStrippedNoSpaces,
+	const FString& RequestedStrippedNormalized,
+	bool bSkipExecPins)
+{
+	for (UEdGraphPin* P : Pins)
+	{
+		if (!P) continue;
+
+		if (P->Direction == Direction)
+		{
+			if ((!bSkipExecPins || P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+				&& IMP_DoesPinNameMatchLookup(P->PinName.ToString(), RequestedName, RequestedNoSpaces, RequestedNormalized, RequestedStrippedNoSpaces, RequestedStrippedNormalized))
+			{
+				return P;
+			}
+		}
+
+		if (P->SubPins.Num() > 0)
+		{
+			if (UEdGraphPin* NestedMatch = IMP_FindPinByNameRecursive(P->SubPins, Direction, RequestedName, RequestedNoSpaces, RequestedNormalized, RequestedStrippedNoSpaces, RequestedStrippedNormalized, bSkipExecPins))
+			{
+				return NestedMatch;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
 static UEdGraphPin* IMP_FindOutputPinByName(UEdGraphNode* N, const FString& Name)
 {
 	if (!N || Name.IsEmpty()) return nullptr;
@@ -1537,22 +1628,7 @@ static UEdGraphPin* IMP_FindOutputPinByName(UEdGraphNode* N, const FString& Name
 	const FString RequestedStrippedNoSpaces = RequestedStripped.Replace(TEXT(" "), TEXT(""));
 	const FString RequestedStrippedNormalized = IMP_NormalizePinLookupName(RequestedStripped);
 
-	for (UEdGraphPin* P : N->Pins)
-	{
-		if (!P || P->Direction != EGPD_Output) continue;
-		if (P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
-		const FString PinName = P->PinName.ToString();
-		if (PinName.Equals(Name, ESearchCase::IgnoreCase)) return P;
-
-		const FString PinNoSpaces = PinName.Replace(TEXT(" "), TEXT(""));
-		if (!RequestedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase)) return P;
-		if (!RequestedStrippedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase)) return P;
-
-		const FString PinNormalized = IMP_NormalizePinLookupName(PinName);
-		if (!RequestedNormalized.IsEmpty() && PinNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase)) return P;
-		if (!RequestedStrippedNormalized.IsEmpty() && PinNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase)) return P;
-	}
-	return nullptr;
+	return IMP_FindPinByNameRecursive(N->Pins, EGPD_Output, Name, RequestedNoSpaces, RequestedNormalized, RequestedStrippedNoSpaces, RequestedStrippedNormalized, true);
 }
 static UEdGraphPin* IMP_FindOutputPin(UEdGraphNode* N, const FString& Name)
 {
@@ -1623,36 +1699,7 @@ static UEdGraphPin* IMP_FindInputPin(UEdGraphNode* N, const FString& Name)
 
 	auto SearchExistingPins = [&]() -> UEdGraphPin*
 	{
-		for (UEdGraphPin* P : N->Pins)
-		{
-			if (!P || P->Direction != EGPD_Input) continue;
-			const FString PinName = P->PinName.ToString();
-			if (PinName.Equals(Name, ESearchCase::IgnoreCase))
-			{
-				return P;
-			}
-
-			const FString PinNoSpaces = PinName.Replace(TEXT(" "), TEXT(""));
-			if (!RequestedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase))
-			{
-				return P;
-			}
-			if (!RequestedStrippedNoSpaces.IsEmpty() && PinNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase))
-			{
-				return P;
-			}
-
-			const FString PinNormalized = IMP_NormalizePinLookupName(PinName);
-			if (!RequestedNormalized.IsEmpty() && PinNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
-			{
-				return P;
-			}
-			if (!RequestedStrippedNormalized.IsEmpty() && PinNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
-			{
-				return P;
-			}
-		}
-		return nullptr;
+		return IMP_FindPinByNameRecursive(N->Pins, EGPD_Input, Name, RequestedNoSpaces, RequestedNormalized, RequestedStrippedNoSpaces, RequestedStrippedNormalized, false);
 	};
 
 	if (UEdGraphPin* DirectMatch = SearchExistingPins())
@@ -1664,9 +1711,11 @@ static UEdGraphPin* IMP_FindInputPin(UEdGraphNode* N, const FString& Name)
 	bool bExpandedStructPin = false;
 	if (K2Schema)
 	{
-		for (UEdGraphPin* P : N->Pins)
+		const TArray<UEdGraphPin*> RootPins = N->Pins;
+		for (UEdGraphPin* P : RootPins)
 		{
-			if (!P || P->Direction != EGPD_Input) continue;
+			if (!P || P->GetOwningNode() != N) continue;
+			if (P->Direction != EGPD_Input) continue;
 			if (P->ParentPin != nullptr) continue;
 			if (P->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) continue;
 			if (P->SubPins.Num() > 0) continue;
@@ -1802,7 +1851,7 @@ static void IMP_ApplyCallInputs(UK2Node_CallFunction* CallNode, const FLispNodeP
 		return nullptr;
 	};
 
-	TMap<FString, UK2Node_MakeStruct*> StructInputBuilders;
+	TMap<FString, UEdGraphNode*> StructInputBuilders;
 	auto TryAssignStructMemberKeyword = [&Ctx, CallNode, &StructInputBuilders, &MarkAssigned](const FString& KeywordName, const FLispNodePtr& ValueNode) -> bool
 	{
 		const FString StableKeywordName = IMP_StripGeneratedPinSuffixes(KeywordName);
@@ -1826,31 +1875,69 @@ static void IMP_ApplyCallInputs(UK2Node_CallFunction* CallNode, const FLispNodeP
 			return false;
 		}
 
-		const FString BuilderKey = RootInputPin->PinName.ToString();
-		UK2Node_MakeStruct* MakeStructNode = StructInputBuilders.FindRef(BuilderKey);
-		if (!MakeStructNode)
-		{
-			MakeStructNode = NewObject<UK2Node_MakeStruct>(Ctx.Graph);
-			MakeStructNode->StructType = StructType;
-			MakeStructNode->NodePosX = Ctx.CurrentX;
-			MakeStructNode->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(MakeStructNode, false, false);
-			MakeStructNode->AllocateDefaultPins();
-			IMP_EnsureGuid(MakeStructNode);
-			Ctx.AdvancePosition();
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), MakeStructNode);
-			StructInputBuilders.Add(BuilderKey, MakeStructNode);
+		const FString MemberRequestedNoSpaces = MemberPinName.Replace(TEXT(" "), TEXT(""));
+		const FString MemberRequestedNormalized = IMP_NormalizePinLookupName(MemberPinName);
+		const FString MemberRequestedStripped = IMP_StripGeneratedPinSuffixes(MemberPinName);
+		const FString MemberRequestedStrippedNoSpaces = MemberRequestedStripped.Replace(TEXT(" "), TEXT(""));
+		const FString MemberRequestedStrippedNormalized = IMP_NormalizePinLookupName(MemberRequestedStripped);
 
-			if (UEdGraphPin* StructOutputPin = IMP_FindOutputPin(MakeStructNode, TEXT("")))
+		if (RootInputPin->SubPins.Num() == 0)
+		{
+			if (const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(CallNode->GetSchema()))
+			{
+				K2Schema->SplitPin(RootInputPin, false);
+			}
+		}
+
+		if (UEdGraphPin* DirectMemberInputPin = IMP_FindPinByNameRecursive(RootInputPin->SubPins, EGPD_Input, MemberPinName, MemberRequestedNoSpaces, MemberRequestedNormalized, MemberRequestedStrippedNoSpaces, MemberRequestedStrippedNormalized, false))
+		{
+			IMP_SetPinFromExpr(DirectMemberInputPin, ValueNode, Ctx);
+			MarkAssigned(RootInputPin);
+			return true;
+		}
+
+		const FString BuilderKey = RootInputPin->PinName.ToString();
+		UEdGraphNode* StructBuilderNode = StructInputBuilders.FindRef(BuilderKey);
+		if (!StructBuilderNode)
+		{
+			if (StructType->HasMetaData(FBlueprintMetadata::MD_NativeMakeFunction))
+			{
+				const FString NativeMakeFunctionPath = StructType->GetMetaData(FBlueprintMetadata::MD_NativeMakeFunction);
+				if (UFunction* NativeMakeFunction = FindObject<UFunction>(nullptr, *NativeMakeFunctionPath, true))
+				{
+					UK2Node_CallFunction* MakeCallNode = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+					MakeCallNode->SetFromFunction(NativeMakeFunction);
+					StructBuilderNode = MakeCallNode;
+				}
+			}
+
+			if (!StructBuilderNode)
+			{
+				UK2Node_MakeStruct* MakeStructNode = NewObject<UK2Node_MakeStruct>(Ctx.Graph);
+				MakeStructNode->StructType = StructType;
+				StructBuilderNode = MakeStructNode;
+			}
+
+			StructBuilderNode->NodePosX = Ctx.CurrentX;
+			StructBuilderNode->NodePosY = Ctx.CurrentY;
+			Ctx.Graph->AddNode(StructBuilderNode, false, false);
+			StructBuilderNode->AllocateDefaultPins();
+			IMP_EnsureGuid(StructBuilderNode);
+			Ctx.AdvancePosition();
+			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), StructBuilderNode);
+			StructInputBuilders.Add(BuilderKey, StructBuilderNode);
+
+			if (UEdGraphPin* StructOutputPin = IMP_FindOutputPin(StructBuilderNode, TEXT("")))
 			{
 				IMP_Connect(StructOutputPin, RootInputPin, Ctx);
 			}
 		}
 
-		UEdGraphPin* MemberInputPin = IMP_FindInputPin(MakeStructNode, MemberPinName);
+		UEdGraphPin* MemberInputPin = IMP_FindInputPin(StructBuilderNode, MemberPinName);
 		if (!MemberInputPin)
 		{
-			Ctx.Errors.Add(FString::Printf(TEXT("IMP: make-struct input pin not found: %s.%s"), *StructType->GetName(), *MemberPinName));
+			const FString BuilderTitle = StructBuilderNode ? StructBuilderNode->GetNodeTitle(ENodeTitleType::ListView).ToString() : TEXT("<null>");
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: struct builder input pin not found: %s.%s via %s"), *StructType->GetName(), *MemberPinName, *BuilderTitle));
 			return true;
 		}
 
@@ -1995,6 +2082,20 @@ static bool IMP_ApplyLispTypeToPin(UEdGraphPin* Pin, const FString& TypeName)
 	if (!Pin) return false;
 
 	const FString Normalized = TypeName.TrimStartAndEnd().ToLower();
+	if (Normalized == TEXT("float"))
+	{
+		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		Pin->PinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+		Pin->PinType.PinSubCategoryObject = nullptr;
+		return true;
+	}
+	if (Normalized == TEXT("double") || Normalized == TEXT("real"))
+	{
+		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		Pin->PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+		Pin->PinType.PinSubCategoryObject = nullptr;
+		return true;
+	}
 	if (Normalized == TEXT("vector"))
 	{
 		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
@@ -3053,6 +3154,18 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 		return false;
 	}
 
+	if (Lower == TEXT("float"))
+	{
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		OutPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+		return true;
+	}
+	if (Lower == TEXT("double") || Lower == TEXT("real"))
+	{
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
+		OutPinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+		return true;
+	}
 	if (Lower == TEXT("vector"))
 	{
 		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Struct;
@@ -3614,6 +3727,26 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 			SelfNode->AllocateDefaultPins(); IMP_EnsureGuid(SelfNode);
 			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), SelfNode);
 			return SelfNode->FindPin(UEdGraphSchema_K2::PN_Self);
+		}
+		if (Sym.Equals(TEXT("true"), ESearchCase::IgnoreCase) || Sym.Equals(TEXT("false"), ESearchCase::IgnoreCase))
+		{
+			if (UFunction* MakeLiteralBool = UKismetSystemLibrary::StaticClass()->FindFunctionByName(TEXT("MakeLiteralBool")))
+			{
+				UK2Node_CallFunction* LiteralNode = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+				LiteralNode->SetFromFunction(MakeLiteralBool);
+				LiteralNode->NodePosX = Ctx.CurrentX;
+				LiteralNode->NodePosY = Ctx.CurrentY;
+				Ctx.Graph->AddNode(LiteralNode, false, false);
+				LiteralNode->AllocateDefaultPins();
+				IMP_EnsureGuid(LiteralNode);
+				Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), LiteralNode);
+				if (UEdGraphPin* ValuePin = LiteralNode->FindPin(TEXT("Value")))
+				{
+					ValuePin->DefaultValue = Sym.Equals(TEXT("true"), ESearchCase::IgnoreCase) ? TEXT("true") : TEXT("false");
+				}
+				return IMP_FindOutputPin(LiteralNode, TEXT("ReturnValue"));
+			}
+			return nullptr;
 		}
 
 		// Check variable table
@@ -4613,9 +4746,13 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 
 	UK2Node_Event* EventNode = nullptr;
 
+	// 当前 DSL 里只有 custom event 会显式导出 :param；若带 :param 仍去匹配 override/interface，
+	// 容易把 custom event 误建成 UK2Node_Event 并丢掉自定义参数。
+	const bool bHasExplicitParams = EventForm->HasKeyword(TEXT(":param"));
+
 	// Override / interface event / custom event?
-	UFunction* OverrideFunc = IMP_FindParentFunction(EventName, Ctx);
-	UFunction* InterfaceFunc = OverrideFunc ? nullptr : IMP_FindImplementedInterfaceFunction(EventName, Ctx);
+	UFunction* OverrideFunc = bHasExplicitParams ? nullptr : IMP_FindParentFunction(EventName, Ctx);
+	UFunction* InterfaceFunc = (bHasExplicitParams || OverrideFunc) ? nullptr : IMP_FindImplementedInterfaceFunction(EventName, Ctx);
 	UFunction* EventSignatureFunc = OverrideFunc ? OverrideFunc : InterfaceFunc;
 
 	if (EventSignatureFunc)
@@ -4702,7 +4839,8 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 
 		if (bChangedParams)
 		{
-			CustomEventNode->ReconstructNode();
+			// 新建 custom event 时 CreateUserDefinedPin 会直接创建可用 pin；
+			// 这里若再 ReconstructNode，反而容易把刚加上的参数 pin 弄丢或变成 orphan。
 		}
 	}
 
