@@ -146,9 +146,50 @@
       "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CallParentReuseProbe :: EventGraph",
       "issue": "call-parent 导出已带 :id，但 importer 过去仍直接新建 UK2Node_CallParentFunction，导致 update 时父类调用节点 identity 漂移。",
       "notes": "最小 probe 在 BlueprintInitializeAnimation 上调用 call-parent，要求 call-parent 的 :id 在 update 前后保持不变。"
+    },
+    {
+      "id": "incremental_input_action_reuse",
+      "script_path": "incremental_input_action_reuse_probe.py",
+      "result_path": "incremental_input_action_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/BP_InputActionReuseProbe :: EventGraph",
+      "issue": "input-action 根入口虽然导出带 :event-id，但 MergeAppend update 过去仍会直接新建 UK2Node_InputAction，导致 event identity 漂移。",
+      "notes": "最小 probe 固定 action=KeyDetect，仅检查 input-action 的 :event-id 在 update 前后保持不变，且 pressed body 文本更新成功。"
+    },
+    {
+      "id": "incremental_input_key_reuse",
+      "script_path": "incremental_input_key_reuse_probe.py",
+      "result_path": "incremental_input_key_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/BP_InputKeyReuseProbe :: EventGraph",
+      "issue": "input-key 根入口虽然导出带 :event-id，但 MergeAppend update 过去仍会直接新建 UK2Node_InputKey，导致 event identity 漂移。",
+      "notes": "最小 probe 固定 key=SpaceBar + shift=true，仅检查 input-key 的 :event-id 在 update 前后保持不变，且 pressed body 文本更新成功。"
+    },
+    {
+      "id": "incremental_component_bound_event_reuse",
+      "script_path": "incremental_component_bound_event_reuse_probe.py",
+      "result_path": "incremental_component_bound_event_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/BP_ComponentBoundEventReuseProbe :: EventGraph",
+      "issue": "component-bound-event 根入口虽然导出带 :event-id，但 MergeAppend update 过去仍会直接新建 UK2Node_ComponentBoundEvent，导致 event identity 漂移。",
+      "notes": "最小 probe 固定 CapsuleComponent/OnComponentBeginOverlap，仅检查 component-bound-event 的 :event-id 在 update 前后保持不变，且 body 文本更新成功。"
+    },
+    {
+      "id": "incremental_actor_bound_event_reuse",
+      "script_path": "incremental_actor_bound_event_reuse_probe.py",
+      "result_path": "incremental_actor_bound_event_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_DemoLevel_ActorBoundEventReuseProbe :: EventGraph",
+      "issue": "actor-bound-event 根入口虽然导出带 :event-id，但 MergeAppend update 过去仍会直接新建 UK2Node_ActorBoundEvent，导致 LevelScript 里的 event identity 漂移。",
+      "notes": "最小 probe 会复制 ALS_DemoLevel 并创建一个带固定 label 的 actor，仅检查 actor-bound-event 的 :event-id 在 update 前后保持不变，且 body 文本更新成功。"
     }
   ]
 }
+
 
 
 

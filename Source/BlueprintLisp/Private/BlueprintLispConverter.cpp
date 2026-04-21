@@ -1586,6 +1586,7 @@ static bool IMP_IsEventStableIdNode(UEdGraphNode* Node)
 	}
 
 	if (Cast<UK2Node_InputAction>(Node) || Cast<UK2Node_InputKey>(Node)
+		|| Cast<UK2Node_ComponentBoundEvent>(Node) || Cast<UK2Node_ActorBoundEvent>(Node)
 		|| Cast<UK2Node_CustomEvent>(Node) || Cast<UK2Node_Event>(Node) || Cast<UK2Node_FunctionEntry>(Node))
 	{
 		return true;
@@ -1683,7 +1684,7 @@ static void IMP_ResetReusableBodyNodePool(FBPImportContext& Ctx)
 	Ctx.ConsumedReusableBodyGuids.Reset();
 }
 
-static void IMP_PrepareExistingEventBodyForIncrementalReuse(UK2Node_Event* EventNode, FBPImportContext& Ctx)
+static void IMP_PrepareExistingEventBodyForIncrementalReuse(UEdGraphNode* EventNode, FBPImportContext& Ctx)
 {
 	IMP_ResetReusableBodyNodePool(Ctx);
 	if (!EventNode || !Ctx.Graph)
@@ -1692,10 +1693,15 @@ static void IMP_PrepareExistingEventBodyForIncrementalReuse(UK2Node_Event* Event
 	}
 
 	TSet<UEdGraphNode*> NodesToReuse;
-	if (UEdGraphPin* ExecOutPin = IMP_GetExecOutput(EventNode))
+	for (UEdGraphPin* Pin : EventNode->Pins)
 	{
-		IMP_CollectDownstreamExecNodes(ExecOutPin, NodesToReuse);
-		ExecOutPin->BreakAllPinLinks();
+		if (!Pin || Pin->Direction != EGPD_Output || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		{
+			continue;
+		}
+
+		IMP_CollectDownstreamExecNodes(Pin, NodesToReuse);
+		Pin->BreakAllPinLinks();
 	}
 
 	TSet<FGuid> AllowedGuids;
@@ -2246,6 +2252,293 @@ static UK2Node_Event* IMP_FindReusableEventNode(const FLispNodePtr& EventForm, c
 		if (UK2Node_Event* Candidate = Cast<UK2Node_Event>(Node))
 		{
 			if (IMP_IsCompatibleExistingEventNode(Candidate, EventName, EventSignatureFunc, bHasExplicitParams))
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+static bool IMP_IsCompatibleExistingInputActionNode(UK2Node_InputAction* InputNode, const FString& RequestedActionName)
+{
+	return InputNode
+		&& InputNode->InputActionName.ToString().Equals(RequestedActionName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_InputAction* IMP_FindReusableInputActionNode(const FLispNodePtr& Form, const FString& ActionName, FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph || Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	TArray<UEdGraphNode*> ExistingInputNodes;
+	for (UEdGraphNode* Node : Ctx.Graph->Nodes)
+	{
+		if (UK2Node_InputAction* InputNode = Cast<UK2Node_InputAction>(Node))
+		{
+			if (!Ctx.ConsumedRootEventGuids.Contains(InputNode->NodeGuid))
+			{
+				ExistingInputNodes.Add(InputNode);
+			}
+		}
+	}
+
+	const FString RequestedEventId = IMP_GetKeywordAtomValue(Form, TEXT(":event-id")).ToLower();
+	if (!RequestedEventId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Ctx.Graph, true, StableIdToNode, nullptr, &Ctx.ConsumedRootEventGuids);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+		{
+			if (UK2Node_InputAction* MatchedById = Cast<UK2Node_InputAction>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingInputActionNode(MatchedById, ActionName))
+				{
+					return MatchedById;
+				}
+			}
+		}
+	}
+
+	for (UEdGraphNode* Node : ExistingInputNodes)
+	{
+		if (UK2Node_InputAction* Candidate = Cast<UK2Node_InputAction>(Node))
+		{
+			if (IMP_IsCompatibleExistingInputActionNode(Candidate, ActionName))
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+static bool IMP_IsCompatibleExistingInputKeyNode(UK2Node_InputKey* InputNode, const FString& RequestedKeyName)
+{
+	if (!InputNode)
+	{
+		return false;
+	}
+
+	FString ExistingKeyName = InputNode->InputKey.GetFName().ToString();
+	if (ExistingKeyName.IsEmpty())
+	{
+		ExistingKeyName = InputNode->InputKey.ToString();
+	}
+	return ExistingKeyName.Equals(RequestedKeyName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_InputKey* IMP_FindReusableInputKeyNode(const FLispNodePtr& Form, const FString& KeyName, FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph || Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	TArray<UEdGraphNode*> ExistingInputNodes;
+	for (UEdGraphNode* Node : Ctx.Graph->Nodes)
+	{
+		if (UK2Node_InputKey* InputNode = Cast<UK2Node_InputKey>(Node))
+		{
+			if (!Ctx.ConsumedRootEventGuids.Contains(InputNode->NodeGuid))
+			{
+				ExistingInputNodes.Add(InputNode);
+			}
+		}
+	}
+
+	const FString RequestedEventId = IMP_GetKeywordAtomValue(Form, TEXT(":event-id")).ToLower();
+	if (!RequestedEventId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Ctx.Graph, true, StableIdToNode, nullptr, &Ctx.ConsumedRootEventGuids);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+		{
+			if (UK2Node_InputKey* MatchedById = Cast<UK2Node_InputKey>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingInputKeyNode(MatchedById, KeyName))
+				{
+					return MatchedById;
+				}
+			}
+		}
+	}
+
+	for (UEdGraphNode* Node : ExistingInputNodes)
+	{
+		if (UK2Node_InputKey* Candidate = Cast<UK2Node_InputKey>(Node))
+		{
+			if (IMP_IsCompatibleExistingInputKeyNode(Candidate, KeyName))
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+static FString IMP_GetComponentBoundEventDelegateName(UK2Node_ComponentBoundEvent* EventNode)
+{
+	if (!EventNode)
+	{
+		return FString();
+	}
+
+	FString DelegateName = EventNode->GetDocumentationExcerptName();
+	if (DelegateName.IsEmpty())
+	{
+		if (FMulticastDelegateProperty* DelegateProperty = EventNode->GetTargetDelegateProperty())
+		{
+			DelegateName = DelegateProperty->GetFName().ToString();
+		}
+	}
+	return DelegateName;
+}
+
+static bool IMP_IsCompatibleExistingComponentBoundEventNode(UK2Node_ComponentBoundEvent* EventNode, const FString& RequestedComponentName, const FString& RequestedDelegateName)
+{
+	return EventNode
+		&& EventNode->GetComponentPropertyName().ToString().Equals(RequestedComponentName, ESearchCase::IgnoreCase)
+		&& IMP_GetComponentBoundEventDelegateName(EventNode).Equals(RequestedDelegateName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_ComponentBoundEvent* IMP_FindReusableComponentBoundEventNode(const FLispNodePtr& Form, const FString& ComponentName, const FString& DelegateName, FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph || Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	TArray<UEdGraphNode*> ExistingEventNodes;
+	for (UEdGraphNode* Node : Ctx.Graph->Nodes)
+	{
+		if (UK2Node_ComponentBoundEvent* EventNode = Cast<UK2Node_ComponentBoundEvent>(Node))
+		{
+			if (!Ctx.ConsumedRootEventGuids.Contains(EventNode->NodeGuid))
+			{
+				ExistingEventNodes.Add(EventNode);
+			}
+		}
+	}
+
+	const FString RequestedEventId = IMP_GetKeywordAtomValue(Form, TEXT(":event-id")).ToLower();
+	if (!RequestedEventId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Ctx.Graph, true, StableIdToNode, nullptr, &Ctx.ConsumedRootEventGuids);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+		{
+			if (UK2Node_ComponentBoundEvent* MatchedById = Cast<UK2Node_ComponentBoundEvent>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingComponentBoundEventNode(MatchedById, ComponentName, DelegateName))
+				{
+					return MatchedById;
+				}
+			}
+		}
+	}
+
+	for (UEdGraphNode* Node : ExistingEventNodes)
+	{
+		if (UK2Node_ComponentBoundEvent* Candidate = Cast<UK2Node_ComponentBoundEvent>(Node))
+		{
+			if (IMP_IsCompatibleExistingComponentBoundEventNode(Candidate, ComponentName, DelegateName))
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
+static FString IMP_GetActorBoundEventActorName(UK2Node_ActorBoundEvent* EventNode)
+{
+	if (!EventNode)
+	{
+		return FString();
+	}
+
+	if (AActor* EventOwner = EventNode->GetReferencedLevelActor())
+	{
+		const FString ActorLabel = EventOwner->GetActorLabel();
+		return ActorLabel.IsEmpty() ? EventOwner->GetName() : ActorLabel;
+	}
+
+	return FString();
+}
+
+static FString IMP_GetActorBoundEventDelegateName(UK2Node_ActorBoundEvent* EventNode)
+{
+	if (!EventNode)
+	{
+		return FString();
+	}
+
+	FString DelegateName = EventNode->GetDocumentationExcerptName();
+	if (DelegateName.IsEmpty())
+	{
+		if (FMulticastDelegateProperty* DelegateProperty = EventNode->GetTargetDelegateProperty())
+		{
+			DelegateName = DelegateProperty->GetFName().ToString();
+		}
+	}
+	return DelegateName;
+}
+
+static bool IMP_IsCompatibleExistingActorBoundEventNode(UK2Node_ActorBoundEvent* EventNode, const FString& RequestedActorName, const FString& RequestedDelegateName)
+{
+	return EventNode
+		&& IMP_GetActorBoundEventActorName(EventNode).Equals(RequestedActorName, ESearchCase::IgnoreCase)
+		&& IMP_GetActorBoundEventDelegateName(EventNode).Equals(RequestedDelegateName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_ActorBoundEvent* IMP_FindReusableActorBoundEventNode(const FLispNodePtr& Form, const FString& ActorName, const FString& DelegateName, FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph || Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	TArray<UEdGraphNode*> ExistingEventNodes;
+	for (UEdGraphNode* Node : Ctx.Graph->Nodes)
+	{
+		if (UK2Node_ActorBoundEvent* EventNode = Cast<UK2Node_ActorBoundEvent>(Node))
+		{
+			if (!Ctx.ConsumedRootEventGuids.Contains(EventNode->NodeGuid))
+			{
+				ExistingEventNodes.Add(EventNode);
+			}
+		}
+	}
+
+	const FString RequestedEventId = IMP_GetKeywordAtomValue(Form, TEXT(":event-id")).ToLower();
+	if (!RequestedEventId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Ctx.Graph, true, StableIdToNode, nullptr, &Ctx.ConsumedRootEventGuids);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+		{
+			if (UK2Node_ActorBoundEvent* MatchedById = Cast<UK2Node_ActorBoundEvent>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingActorBoundEventNode(MatchedById, ActorName, DelegateName))
+				{
+					return MatchedById;
+				}
+			}
+		}
+	}
+
+	for (UEdGraphNode* Node : ExistingEventNodes)
+	{
+		if (UK2Node_ActorBoundEvent* Candidate = Cast<UK2Node_ActorBoundEvent>(Node))
+		{
+			if (IMP_IsCompatibleExistingActorBoundEventNode(Candidate, ActorName, DelegateName))
 			{
 				return Candidate;
 			}
@@ -4263,16 +4556,32 @@ static void IMP_ConvertInputActionForm(const FLispNodePtr& Form, FBPImportContex
 		return;
 	}
 
-	UK2Node_InputAction* InputNode = NewObject<UK2Node_InputAction>(Ctx.Graph);
+	UK2Node_InputAction* InputNode = IMP_FindReusableInputActionNode(Form, ActionName, Ctx);
+	const bool bReusedExistingInputNode = (InputNode != nullptr);
+	if (bReusedExistingInputNode)
+	{
+		IMP_PrepareExistingEventBodyForIncrementalReuse(InputNode, Ctx);
+	}
+	else
+	{
+		InputNode = NewObject<UK2Node_InputAction>(Ctx.Graph);
+		InputNode->NodePosX = Ctx.CurrentX;
+		InputNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(InputNode, false, false);
+		InputNode->AllocateDefaultPins();
+		IMP_EnsureGuid(InputNode);
+	}
+
 	InputNode->InputActionName = FName(*ActionName);
-	if (Form->HasKeyword(TEXT(":consume-input"))) InputNode->bConsumeInput = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":consume-input")));
-	if (Form->HasKeyword(TEXT(":execute-when-paused"))) InputNode->bExecuteWhenPaused = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":execute-when-paused")));
-	if (Form->HasKeyword(TEXT(":override-parent-binding"))) InputNode->bOverrideParentBinding = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":override-parent-binding")));
-	InputNode->NodePosX = Ctx.CurrentX;
-	InputNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(InputNode, false, false);
-	InputNode->AllocateDefaultPins();
-	IMP_EnsureGuid(InputNode);
+	InputNode->bConsumeInput = Form->HasKeyword(TEXT(":consume-input")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":consume-input")));
+	InputNode->bExecuteWhenPaused = Form->HasKeyword(TEXT(":execute-when-paused")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":execute-when-paused")));
+	InputNode->bOverrideParentBinding = Form->HasKeyword(TEXT(":override-parent-binding")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":override-parent-binding")));
+	if (bReusedExistingInputNode)
+	{
+		InputNode->ReconstructNode();
+	}
+
+	Ctx.ConsumedRootEventGuids.Add(InputNode->NodeGuid);
 	Ctx.AdvancePosition();
 	IMP_RegisterEventOutputPins(InputNode, Ctx);
 
@@ -4280,6 +4589,10 @@ static void IMP_ConvertInputActionForm(const FLispNodePtr& Form, FBPImportContex
 	IMP_ConvertExecBody(PressedBody, Ctx, PressedPin);
 	UEdGraphPin* ReleasedPin = InputNode->GetReleasedPin();
 	IMP_ConvertExecBody(ReleasedBody, Ctx, ReleasedPin);
+	if (bReusedExistingInputNode)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
 	Ctx.NewRow();
 }
 
@@ -4335,21 +4648,37 @@ static void IMP_ConvertInputKeyForm(const FLispNodePtr& Form, FBPImportContext& 
 		return;
 	}
 
-	UK2Node_InputKey* InputNode = NewObject<UK2Node_InputKey>(Ctx.Graph);
+	UK2Node_InputKey* InputNode = IMP_FindReusableInputKeyNode(Form, KeyName, Ctx);
+	const bool bReusedExistingInputNode = (InputNode != nullptr);
+	if (bReusedExistingInputNode)
+	{
+		IMP_PrepareExistingEventBodyForIncrementalReuse(InputNode, Ctx);
+	}
+	else
+	{
+		InputNode = NewObject<UK2Node_InputKey>(Ctx.Graph);
+		InputNode->NodePosX = Ctx.CurrentX;
+		InputNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(InputNode, false, false);
+		InputNode->AllocateDefaultPins();
+		IMP_EnsureGuid(InputNode);
+	}
+
 	InputNode->InputKey = FKey(*KeyName);
-	if (Form->HasKeyword(TEXT(":consume-input"))) InputNode->bConsumeInput = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":consume-input")));
-	if (Form->HasKeyword(TEXT(":execute-when-paused"))) InputNode->bExecuteWhenPaused = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":execute-when-paused")));
-	if (Form->HasKeyword(TEXT(":override-parent-binding"))) InputNode->bOverrideParentBinding = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":override-parent-binding")));
-	if (Form->HasKeyword(TEXT(":control"))) InputNode->bControl = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":control")));
-	if (Form->HasKeyword(TEXT(":ctrl"))) InputNode->bControl = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":ctrl")));
-	if (Form->HasKeyword(TEXT(":alt"))) InputNode->bAlt = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":alt")));
-	if (Form->HasKeyword(TEXT(":shift"))) InputNode->bShift = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":shift")));
-	if (Form->HasKeyword(TEXT(":command"))) InputNode->bCommand = IMP_IsTruthy(Form->GetKeywordArg(TEXT(":command")));
-	InputNode->NodePosX = Ctx.CurrentX;
-	InputNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(InputNode, false, false);
-	InputNode->AllocateDefaultPins();
-	IMP_EnsureGuid(InputNode);
+	InputNode->bConsumeInput = Form->HasKeyword(TEXT(":consume-input")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":consume-input")));
+	InputNode->bExecuteWhenPaused = Form->HasKeyword(TEXT(":execute-when-paused")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":execute-when-paused")));
+	InputNode->bOverrideParentBinding = Form->HasKeyword(TEXT(":override-parent-binding")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":override-parent-binding")));
+	InputNode->bControl = (Form->HasKeyword(TEXT(":control")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":control"))))
+		|| (Form->HasKeyword(TEXT(":ctrl")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":ctrl"))));
+	InputNode->bAlt = Form->HasKeyword(TEXT(":alt")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":alt")));
+	InputNode->bShift = Form->HasKeyword(TEXT(":shift")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":shift")));
+	InputNode->bCommand = Form->HasKeyword(TEXT(":command")) && IMP_IsTruthy(Form->GetKeywordArg(TEXT(":command")));
+	if (bReusedExistingInputNode)
+	{
+		InputNode->ReconstructNode();
+	}
+
+	Ctx.ConsumedRootEventGuids.Add(InputNode->NodeGuid);
 	Ctx.AdvancePosition();
 	IMP_RegisterEventOutputPins(InputNode, Ctx);
 
@@ -4357,6 +4686,10 @@ static void IMP_ConvertInputKeyForm(const FLispNodePtr& Form, FBPImportContext& 
 	IMP_ConvertExecBody(PressedBody, Ctx, PressedPin);
 	UEdGraphPin* ReleasedPin = InputNode->GetReleasedPin();
 	IMP_ConvertExecBody(ReleasedBody, Ctx, ReleasedPin);
+	if (bReusedExistingInputNode)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
 	Ctx.NewRow();
 }
 
@@ -4426,19 +4759,34 @@ static void IMP_ConvertComponentBoundEventForm(const FLispNodePtr& Form, FBPImpo
 		return;
 	}
 
-	UK2Node_ComponentBoundEvent* EventNode = NewObject<UK2Node_ComponentBoundEvent>(Ctx.Graph);
-	EventNode->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
-	EventNode->NodePosX = Ctx.CurrentX;
-	EventNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(EventNode, false, false);
-	EventNode->AllocateDefaultPins();
-	IMP_EnsureGuid(EventNode);
+	UK2Node_ComponentBoundEvent* EventNode = IMP_FindReusableComponentBoundEventNode(Form, ComponentName, DelegateName, Ctx);
+	const bool bReusedExistingEventNode = (EventNode != nullptr);
+	if (bReusedExistingEventNode)
+	{
+		IMP_PrepareExistingEventBodyForIncrementalReuse(EventNode, Ctx);
+	}
+	else
+	{
+		EventNode = NewObject<UK2Node_ComponentBoundEvent>(Ctx.Graph);
+		EventNode->InitializeComponentBoundEventParams(ComponentProperty, DelegateProperty);
+		EventNode->NodePosX = Ctx.CurrentX;
+		EventNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(EventNode, false, false);
+		EventNode->AllocateDefaultPins();
+		IMP_EnsureGuid(EventNode);
+	}
+
+	Ctx.ConsumedRootEventGuids.Add(EventNode->NodeGuid);
 	Ctx.AdvancePosition();
 	IMP_RegisterEventOutputPins(EventNode, Ctx);
 
 	UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(EventNode);
 	FLispNodePtr Body = IMP_MakeSeqBody(BodyStatements);
 	IMP_ConvertExecBody(Body, Ctx, CurrentExecPin);
+	if (bReusedExistingEventNode)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
 	Ctx.NewRow();
 }
 
@@ -4516,19 +4864,34 @@ static void IMP_ConvertActorBoundEventForm(const FLispNodePtr& Form, FBPImportCo
 		return;
 	}
 
-	UK2Node_ActorBoundEvent* EventNode = NewObject<UK2Node_ActorBoundEvent>(Ctx.Graph);
-	EventNode->InitializeActorBoundEventParams(TargetActor, DelegateProperty);
-	EventNode->NodePosX = Ctx.CurrentX;
-	EventNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(EventNode, false, false);
-	EventNode->AllocateDefaultPins();
-	IMP_EnsureGuid(EventNode);
+	UK2Node_ActorBoundEvent* EventNode = IMP_FindReusableActorBoundEventNode(Form, ActorName, DelegateName, Ctx);
+	const bool bReusedExistingEventNode = (EventNode != nullptr);
+	if (bReusedExistingEventNode)
+	{
+		IMP_PrepareExistingEventBodyForIncrementalReuse(EventNode, Ctx);
+	}
+	else
+	{
+		EventNode = NewObject<UK2Node_ActorBoundEvent>(Ctx.Graph);
+		EventNode->InitializeActorBoundEventParams(TargetActor, DelegateProperty);
+		EventNode->NodePosX = Ctx.CurrentX;
+		EventNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(EventNode, false, false);
+		EventNode->AllocateDefaultPins();
+		IMP_EnsureGuid(EventNode);
+	}
+
+	Ctx.ConsumedRootEventGuids.Add(EventNode->NodeGuid);
 	Ctx.AdvancePosition();
 	IMP_RegisterEventOutputPins(EventNode, Ctx);
 
 	UEdGraphPin* CurrentExecPin = IMP_GetExecOutput(EventNode);
 	FLispNodePtr Body = IMP_MakeSeqBody(BodyStatements);
 	IMP_ConvertExecBody(Body, Ctx, CurrentExecPin);
+	if (bReusedExistingEventNode)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
 	Ctx.NewRow();
 }
 
