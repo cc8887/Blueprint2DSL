@@ -1540,48 +1540,67 @@ static bool IMP_DoesPinNameMatchLookup(
 		return true;
 	}
 
+	const FString CandidateStripped = IMP_StripGeneratedPinSuffixes(CandidateName);
 	const FString CandidateNoSpaces = CandidateName.Replace(TEXT(" "), TEXT(""));
-	if (!RequestedNoSpaces.IsEmpty() && CandidateNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase))
+	const FString CandidateStrippedNoSpaces = CandidateStripped.Replace(TEXT(" "), TEXT(""));
+	if (!RequestedNoSpaces.IsEmpty()
+		&& (CandidateNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNoSpaces.Equals(RequestedNoSpaces, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
-	if (!RequestedStrippedNoSpaces.IsEmpty() && CandidateNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase))
+	if (!RequestedStrippedNoSpaces.IsEmpty()
+		&& (CandidateNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNoSpaces.Equals(RequestedStrippedNoSpaces, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
 
 	const FString CandidateNormalized = IMP_NormalizePinLookupName(CandidateName);
-	if (!RequestedNormalized.IsEmpty() && CandidateNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+	const FString CandidateStrippedNormalized = IMP_NormalizePinLookupName(CandidateStripped);
+	if (!RequestedNormalized.IsEmpty()
+		&& (CandidateNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNormalized.Equals(RequestedNormalized, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
-	if (!RequestedStrippedNormalized.IsEmpty() && CandidateNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+	if (!RequestedStrippedNormalized.IsEmpty()
+		&& (CandidateNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNormalized.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
 
 	const FString CandidateWithoutLeadingIn = CandidateNormalized.StartsWith(TEXT("in")) ? CandidateNormalized.Mid(2) : CandidateNormalized;
+	const FString CandidateStrippedWithoutLeadingIn = CandidateStrippedNormalized.StartsWith(TEXT("in")) ? CandidateStrippedNormalized.Mid(2) : CandidateStrippedNormalized;
 	const FString RequestedWithoutLeadingIn = RequestedNormalized.StartsWith(TEXT("in")) ? RequestedNormalized.Mid(2) : RequestedNormalized;
 	const FString RequestedStrippedWithoutLeadingIn = RequestedStrippedNormalized.StartsWith(TEXT("in")) ? RequestedStrippedNormalized.Mid(2) : RequestedStrippedNormalized;
-	if (!RequestedWithoutLeadingIn.IsEmpty() && CandidateNormalized.Equals(RequestedWithoutLeadingIn, ESearchCase::IgnoreCase))
+	if (!RequestedWithoutLeadingIn.IsEmpty()
+		&& (CandidateNormalized.Equals(RequestedWithoutLeadingIn, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNormalized.Equals(RequestedWithoutLeadingIn, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
-	if (!RequestedStrippedWithoutLeadingIn.IsEmpty() && CandidateNormalized.Equals(RequestedStrippedWithoutLeadingIn, ESearchCase::IgnoreCase))
+	if (!RequestedStrippedWithoutLeadingIn.IsEmpty()
+		&& (CandidateNormalized.Equals(RequestedStrippedWithoutLeadingIn, ESearchCase::IgnoreCase)
+			|| CandidateStrippedNormalized.Equals(RequestedStrippedWithoutLeadingIn, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
-	if (!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+	if ((!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedNormalized, ESearchCase::IgnoreCase))
+		|| (!CandidateStrippedWithoutLeadingIn.IsEmpty() && CandidateStrippedWithoutLeadingIn.Equals(RequestedNormalized, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
-	if (!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+	if ((!CandidateWithoutLeadingIn.IsEmpty() && CandidateWithoutLeadingIn.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase))
+		|| (!CandidateStrippedWithoutLeadingIn.IsEmpty() && CandidateStrippedWithoutLeadingIn.Equals(RequestedStrippedNormalized, ESearchCase::IgnoreCase)))
 	{
 		return true;
 	}
 
 	return false;
 }
+
 
 static UEdGraphPin* IMP_FindPinByNameRecursive(
 	const TArray<UEdGraphPin*>& Pins,
@@ -4831,6 +4850,10 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 					i += 1;
 					continue;
 				}
+				if (UEdGraphPin* CreatedParamPin = CustomEventNode->FindPin(FName(*ParamName)))
+				{
+					IMP_ApplyLispTypeToPin(CreatedParamPin, ParamType);
+				}
 				bChangedParams = true;
 			}
 
@@ -4839,10 +4862,17 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 
 		if (bChangedParams)
 		{
-			// 新建 custom event 时 CreateUserDefinedPin 会直接创建可用 pin；
-			// 这里若再 ReconstructNode，反而容易把刚加上的参数 pin 弄丢或变成 orphan。
+			const bool bPrevDisableOrphanPinSaving = CustomEventNode->bDisableOrphanPinSaving;
+			CustomEventNode->bDisableOrphanPinSaving = true;
+			CustomEventNode->ReconstructNode();
+			CustomEventNode->bDisableOrphanPinSaving = bPrevDisableOrphanPinSaving;
+			if (const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>())
+			{
+				K2Schema->HandleParameterDefaultValueChanged(CustomEventNode);
+			}
 		}
 	}
+
 
 	const FString EventGuid = EventNode->NodeGuid.ToString();
 	Ctx.TempIdToNode.Add(EventGuid, EventNode);
