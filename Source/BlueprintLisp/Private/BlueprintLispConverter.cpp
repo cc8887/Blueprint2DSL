@@ -1430,8 +1430,12 @@ struct FBPImportContext
 
 	TMap<FString, UEdGraphNode*> TempIdToNode;     // tempId / NodeGuid → node
 	TSet<FGuid> ConsumedRootEventGuids;
+	TArray<UEdGraphNode*> ReusableBodyNodes;
+	TMap<FString, UEdGraphNode*> ReusableBodyStableIdToNode;
+	TSet<FGuid> ConsumedReusableBodyGuids;
 
 	TMap<FString, FString>       VariableToNodeId; // var name → node GUID or _literal_ key
+
 	TMap<FString, FString>       VariableToPin;    // var name → pin name
 	TMap<FString, UFunction*>    FunctionCache;    // deterministic function lookup cache
 
@@ -1497,7 +1501,7 @@ static UScriptStruct* IMP_FindStructByName(const FString& StructName, FBPImportC
 static FString IMP_GetAtomName(const FLispNodePtr& Node);
 static void IMP_EnsureGuid(UEdGraphNode* N);
 static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N);
-
+static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGraphNode*>& OutNodes);
 
 
 
@@ -1574,13 +1578,38 @@ static FString IMP_GetKeywordAtomValue(const FLispNodePtr& Form, const TCHAR* Ke
 	return IMP_GetAtomName(Form->GetKeywordArg(Keyword)).TrimStartAndEnd();
 }
 
-static void IMP_BuildStableIdIndex(const TArray<UEdGraphNode*>& Nodes, TMap<FString, UEdGraphNode*>& OutStableIdToNode)
+static bool IMP_IsEventStableIdNode(UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	if (Cast<UK2Node_InputAction>(Node) || Cast<UK2Node_InputKey>(Node)
+		|| Cast<UK2Node_CustomEvent>(Node) || Cast<UK2Node_Event>(Node) || Cast<UK2Node_FunctionEntry>(Node))
+	{
+		return true;
+	}
+
+	if (UK2Node_Tunnel* TunnelNode = Cast<UK2Node_Tunnel>(Node))
+	{
+		return TunnelNode->DrawNodeAsEntry();
+	}
+
+	return false;
+}
+
+static void IMP_BuildStableIdIndex(UEdGraph* Graph, bool bEventIds, TMap<FString, UEdGraphNode*>& OutStableIdToNode, const TSet<FGuid>* AllowedGuids = nullptr, const TSet<FGuid>* ExcludedGuids = nullptr)
 {
 	OutStableIdToNode.Reset();
+	if (!Graph)
+	{
+		return;
+	}
 
 	TArray<FGuid> Guids;
 	TMap<FGuid, UEdGraphNode*> GuidToNode;
-	for (UEdGraphNode* Node : Nodes)
+	for (UEdGraphNode* Node : Graph->Nodes)
 	{
 		if (!Node)
 		{
@@ -1591,8 +1620,22 @@ static void IMP_BuildStableIdIndex(const TArray<UEdGraphNode*>& Nodes, TMap<FStr
 		{
 			continue;
 		}
+		if (ExcludedGuids && ExcludedGuids->Contains(Node->NodeGuid))
+		{
+			continue;
+		}
+
+		const bool bMatchesGroup = bEventIds ? IMP_IsEventStableIdNode(Node) : !IMP_IsEventStableIdNode(Node);
+		if (!bMatchesGroup)
+		{
+			continue;
+		}
+
 		Guids.Add(Node->NodeGuid);
-		GuidToNode.Add(Node->NodeGuid, Node);
+		if (!AllowedGuids || AllowedGuids->Contains(Node->NodeGuid))
+		{
+			GuidToNode.Add(Node->NodeGuid, Node);
+		}
 	}
 
 	const TMap<FGuid, FString> ShortIds = ComputeShortIds(Guids);
@@ -1605,7 +1648,231 @@ static void IMP_BuildStableIdIndex(const TArray<UEdGraphNode*>& Nodes, TMap<FStr
 	}
 }
 
+static void IMP_ClearAllNodeLinks(UEdGraphNode* Node)
+{
+	if (!Node)
+	{
+		return;
+	}
+
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (Pin)
+		{
+			Pin->BreakAllPinLinks();
+		}
+	}
+}
+
+static bool IMP_IsPendingReusableBodyNode(UEdGraphNode* Node, const FBPImportContext& Ctx)
+{
+	return Node
+		&& Ctx.ReusableBodyNodes.Contains(Node)
+		&& !Ctx.ConsumedReusableBodyGuids.Contains(Node->NodeGuid);
+}
+
+static FString IMP_GetRequestedNodeStableId(const FLispNodePtr& Form)
+{
+	return IMP_GetKeywordAtomValue(Form, TEXT(":id")).ToLower();
+}
+
+static void IMP_ResetReusableBodyNodePool(FBPImportContext& Ctx)
+{
+	Ctx.ReusableBodyNodes.Reset();
+	Ctx.ReusableBodyStableIdToNode.Reset();
+	Ctx.ConsumedReusableBodyGuids.Reset();
+}
+
+static void IMP_PrepareExistingEventBodyForIncrementalReuse(UK2Node_Event* EventNode, FBPImportContext& Ctx)
+{
+	IMP_ResetReusableBodyNodePool(Ctx);
+	if (!EventNode || !Ctx.Graph)
+	{
+		return;
+	}
+
+	TSet<UEdGraphNode*> NodesToReuse;
+	if (UEdGraphPin* ExecOutPin = IMP_GetExecOutput(EventNode))
+	{
+		IMP_CollectDownstreamExecNodes(ExecOutPin, NodesToReuse);
+		ExecOutPin->BreakAllPinLinks();
+	}
+
+	TSet<FGuid> AllowedGuids;
+	for (UEdGraphNode* Node : NodesToReuse)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		IMP_EnsureGuid(Node);
+		Ctx.ReusableBodyNodes.Add(Node);
+		AllowedGuids.Add(Node->NodeGuid);
+		IMP_ClearAllNodeLinks(Node);
+	}
+
+	IMP_BuildStableIdIndex(Ctx.Graph, false, Ctx.ReusableBodyStableIdToNode, &AllowedGuids, nullptr);
+}
+
+static void IMP_FinalizeExistingEventBodyIncrementalReuse(FBPImportContext& Ctx)
+{
+	for (UEdGraphNode* Node : Ctx.ReusableBodyNodes)
+	{
+		if (!Node || Ctx.ConsumedReusableBodyGuids.Contains(Node->NodeGuid))
+		{
+			continue;
+		}
+		Ctx.Graph->RemoveNode(Node);
+	}
+
+	IMP_ResetReusableBodyNodePool(Ctx);
+}
+
+static UEdGraphNode* IMP_FindReusableBodyNodeByStableId(const FLispNodePtr& Form, FBPImportContext& Ctx)
+{
+	if (Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	const FString RequestedId = IMP_GetRequestedNodeStableId(Form);
+	if (RequestedId.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	if (UEdGraphNode* const* FoundNode = Ctx.ReusableBodyStableIdToNode.Find(RequestedId))
+	{
+		if (!Ctx.ConsumedReusableBodyGuids.Contains((*FoundNode)->NodeGuid))
+		{
+			return *FoundNode;
+		}
+	}
+
+	return nullptr;
+}
+
+static void IMP_MarkReusableBodyNodeConsumed(UEdGraphNode* Node, FBPImportContext& Ctx)
+{
+	if (!Node)
+	{
+		return;
+	}
+
+	IMP_ClearAllNodeLinks(Node);
+	Node->ReconstructNode();
+	Ctx.ConsumedReusableBodyGuids.Add(Node->NodeGuid);
+	Ctx.TempIdToNode.FindOrAdd(Node->NodeGuid.ToString()) = Node;
+}
+
+static FString IMP_GetExistingCallNodeName(UK2Node_CallFunction* CallNode)
+{
+	if (!CallNode)
+	{
+		return FString();
+	}
+
+	if (UFunction* TargetFunction = CallNode->GetTargetFunction())
+	{
+		return TargetFunction->GetName();
+	}
+
+	const FName MemberName = CallNode->FunctionReference.GetMemberName();
+	if (!MemberName.IsNone())
+	{
+		return MemberName.ToString();
+	}
+
+	return CallNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+}
+
+static bool IMP_IsCompatibleExistingCallNode(UK2Node_CallFunction* CallNode, const FString& RequestedFunctionName, bool bUseSelfMemberReference)
+{
+	if (!CallNode || Cast<UK2Node_CallParentFunction>(CallNode))
+	{
+		return false;
+	}
+
+	const FString ExistingFunctionName = IMP_GetExistingCallNodeName(CallNode);
+	if (!ExistingFunctionName.Equals(RequestedFunctionName, ESearchCase::IgnoreCase))
+	{
+		return false;
+	}
+
+	const bool bExistingUsesSelfMemberReference = !CallNode->FunctionReference.GetMemberName().IsNone() && CallNode->GetTargetFunction() == nullptr;
+	return bExistingUsesSelfMemberReference == bUseSelfMemberReference;
+}
+
+static UK2Node_CallFunction* IMP_CreateOrReuseCallFunctionNode(const FLispNodePtr& Form, UFunction* Function, const FString& RequestedFunctionName, bool bUseSelfMemberReference, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_CallFunction* ReusableCallNode = Cast<UK2Node_CallFunction>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingCallNode(ReusableCallNode, RequestedFunctionName, bUseSelfMemberReference))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableCallNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableCallNode;
+			}
+		}
+	}
+
+	UK2Node_CallFunction* CallNode = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+	if (bUseSelfMemberReference)
+	{
+		CallNode->FunctionReference.SetSelfMember(FName(*RequestedFunctionName));
+	}
+	else if (Function)
+	{
+		CallNode->SetFromFunction(Function);
+	}
+	CallNode->NodePosX = Ctx.CurrentX;
+	CallNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(CallNode, false, false);
+	CallNode->AllocateDefaultPins();
+	IMP_EnsureGuid(CallNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CallNode);
+	Ctx.TempIdToNode.Add(CallNode->NodeGuid.ToString(), CallNode);
+	return CallNode;
+}
+
+static FString IMP_GetMacroInstanceName(UK2Node_MacroInstance* MacroNode)
+{
+	if (!MacroNode)
+	{
+		return FString();
+	}
+
+	if (UEdGraph* MacroGraph = MacroNode->GetMacroGraph())
+	{
+		return MacroGraph->GetName();
+	}
+
+	return MacroNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+}
+
+static UK2Node_MacroInstance* IMP_FindReusableMacroInstanceNode(const FLispNodePtr& Form, const FString& MacroName, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_MacroInstance* ReusableMacroNode = Cast<UK2Node_MacroInstance>(ReusableNode))
+		{
+			if (IMP_GetMacroInstanceName(ReusableMacroNode).Equals(MacroName, ESearchCase::IgnoreCase))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableMacroNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableMacroNode;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
 static FString IMP_GetReusableEventName(UK2Node_Event* EventNode)
+
 {
 	if (!EventNode)
 	{
@@ -1737,8 +2004,9 @@ static UK2Node_Event* IMP_FindReusableEventNode(const FLispNodePtr& EventForm, c
 	if (!RequestedEventId.IsEmpty())
 	{
 		TMap<FString, UEdGraphNode*> StableIdToNode;
-		IMP_BuildStableIdIndex(ExistingEventNodes, StableIdToNode);
+		IMP_BuildStableIdIndex(Ctx.Graph, true, StableIdToNode, nullptr, &Ctx.ConsumedRootEventGuids);
 		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+
 		{
 			if (UK2Node_Event* MatchedById = Cast<UK2Node_Event>(*FoundNode))
 			{
@@ -3310,18 +3578,27 @@ static UK2Node_MacroInstance* IMP_CreateMacroInstanceNode(const FLispNodePtr& Fo
 		return nullptr;
 	}
 
-	UK2Node_MacroInstance* MacroNode = NewObject<UK2Node_MacroInstance>(Ctx.Graph);
-	MacroNode->SetMacroGraph(MacroGraph);
-	MacroNode->NodePosX = Ctx.CurrentX;
-	MacroNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(MacroNode, false, false);
-	MacroNode->AllocateDefaultPins();
-	IMP_EnsureGuid(MacroNode);
-	Ctx.AdvancePosition();
-	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), MacroNode);
+	UK2Node_MacroInstance* MacroNode = IMP_FindReusableMacroInstanceNode(Form, MacroName, Ctx);
+	if (!MacroNode)
+	{
+		MacroNode = NewObject<UK2Node_MacroInstance>(Ctx.Graph);
+		MacroNode->SetMacroGraph(MacroGraph);
+		MacroNode->NodePosX = Ctx.CurrentX;
+		MacroNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(MacroNode, false, false);
+		MacroNode->AllocateDefaultPins();
+		IMP_EnsureGuid(MacroNode);
+		Ctx.AdvancePosition();
+		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), MacroNode);
+	}
+	else
+	{
+		MacroNode->SetMacroGraph(MacroGraph);
+	}
 	Ctx.TempIdToNode.Add(MacroNode->NodeGuid.ToString(), MacroNode);
 
 	OutPreferredOutputPin = IMP_ConfigureMacroInstanceNode(MacroNode, Form, Ctx, ArgStartIndex);
+
 
 	return MacroNode;
 }
@@ -4171,8 +4448,13 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 			for (int32 NodeIndex = Ctx.Graph->Nodes.Num() - 1; NodeIndex >= 0; --NodeIndex)
 			{
 				UEdGraphNode* ExistingNode = Ctx.Graph->Nodes[NodeIndex];
+				if (!ExistingNode || IMP_IsPendingReusableBodyNode(ExistingNode, Ctx))
+				{
+					continue;
+				}
 				if (UEdGraphPin* MatchedPin = FindMatchingOutputPin(ExistingNode, Sym))
 				{
+
 					IMP_EnsureGuid(ExistingNode);
 					const FString ExistingNodeGuid = ExistingNode->NodeGuid.ToString();
 					Ctx.TempIdToNode.FindOrAdd(ExistingNodeGuid) = ExistingNode;
@@ -4330,13 +4612,11 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 	{
 		if (UFunction* CompoundFunc = IMP_FindFunction(CompoundBindingName, Ctx))
 		{
-			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-			CN->SetFromFunction(CompoundFunc); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN);
+			UK2Node_CallFunction* CN = IMP_CreateOrReuseCallFunctionNode(Expr, CompoundFunc, CompoundBindingName, false, Ctx);
 			IMP_ApplyCallInputs(CN, Expr, CompoundBindingValueIndex, true, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 			return IMP_FindOutputPin(CN, TEXT("ReturnValue"));
 		}
+
 
 		if (Expr->Num() == 2 && CompoundBindingValueIndex == 1)
 		{
@@ -4350,13 +4630,11 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 	{
 		if (UFunction* F = IMP_FindFunction(PrimaryFormName, Ctx))
 		{
-			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN);
+			UK2Node_CallFunction* CN = IMP_CreateOrReuseCallFunctionNode(Expr, F, PrimaryFormName, false, Ctx);
 			IMP_ApplyCallInputs(CN, Expr, PrimaryArgStartIndex, true, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 			return IMP_FindOutputPin(CN, TEXT("ReturnValue"));
 		}
+
 
 		// Try variable get with same name as form
 		UK2Node_VariableGet* VarGet = NewObject<UK2Node_VariableGet>(Ctx.Graph);
@@ -4953,21 +5231,18 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			for (UEdGraph* G : Ctx.Blueprint->FunctionGraphs)
 				if (G && G->GetFName() == FName(*FuncName))
 				{
-					UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-					CN->FunctionReference.SetSelfMember(FName(*FuncName));
-					CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-					Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN); Ctx.AdvancePosition();
+					UK2Node_CallFunction* CN = IMP_CreateOrReuseCallFunctionNode(Form, nullptr, FuncName, true, Ctx);
 					if (UEdGraphPin* TargetPin = CN->FindPin(UEdGraphSchema_K2::PN_Self))
 					{
 						UEdGraphPin* TargetSrc = IMP_ResolveLispExpr(Form->Get(1), Ctx);
 						if (TargetSrc) IMP_Connect(TargetSrc, TargetPin, Ctx);
 					}
 					IMP_ApplyCallInputs(CN, Form, 3, false, Ctx);
-					Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 					OutExecPin = IMP_GetExecOutput(CN);
 					return CN;
 				}
 		}
+
 
 		if (F)
 		{
@@ -5083,8 +5358,9 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 	const bool bReusedExistingEventNode = (EventNode != nullptr);
 	if (bReusedExistingEventNode)
 	{
-		IMP_ClearExistingEventExecChain(EventNode, Ctx);
+		IMP_PrepareExistingEventBodyForIncrementalReuse(EventNode, Ctx);
 	}
+
 	else if (EventSignatureFunc)
 	{
 		EventNode = NewObject<UK2Node_Event>(Ctx.Graph);
@@ -5222,8 +5498,14 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 		else if (SN && !Cast<UK2Node_IfThenElse>(SN)) CurrentExecPin = IMP_GetExecOutput(SN);
 	}
 
+	if (bReusedExistingEventNode)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
+
 	Ctx.NewRow();
 }
+
 
 // ============================================================================
 // End of Import helpers
