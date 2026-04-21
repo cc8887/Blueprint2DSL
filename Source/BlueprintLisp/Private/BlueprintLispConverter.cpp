@@ -30,7 +30,9 @@
 #include "K2Node_CustomEvent.h"
 #include "K2Node_FunctionEntry.h"
 #include "K2Node_FunctionResult.h"
+#include "K2Node_Knot.h"
 #include "K2Node_Tunnel.h"
+
 #include "K2Node_MacroInstance.h"
 #include "K2Node_DynamicCast.h"
 #include "K2Node_ExecutionSequence.h"
@@ -348,8 +350,34 @@ static FLispNodePtr EXP_BuildMacroCallForm(UK2Node_MacroInstance* MacroInst, UEd
 
 // ----- Convert pure (data-flow) expression to Lisp -----
 
+static FLispNodePtr EXP_ConvertLiteralBoolCallToLisp(UK2Node_CallFunction* CallNode, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited)
+{
+	if (!CallNode)
+	{
+		return FLispNode::MakeNil();
+	}
+
+	UFunction* TargetFunction = CallNode->GetTargetFunction();
+	if (!TargetFunction || TargetFunction->GetName() != TEXT("MakeLiteralBool"))
+	{
+		return FLispNode::MakeNil();
+	}
+
+	for (UEdGraphPin* Pin : CallNode->Pins)
+	{
+		if (!Pin || Pin->Direction != EGPD_Input) continue;
+		if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+		if (Pin->PinName == UEdGraphSchema_K2::PN_Self) continue;
+		if (Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Boolean) continue;
+		return ConvertPureExpressionToLisp(Pin, Graph, Visited);
+	}
+
+	return FLispNode::MakeNil();
+}
+
 static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited)
 {
+
 	if (!ValuePin || ValuePin->LinkedTo.Num() == 0)
 	{
 		// Return default value as literal
@@ -393,9 +421,18 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		}
 	}
 
+	if (UK2Node_Knot* KnotNode = Cast<UK2Node_Knot>(SourceNode))
+	{
+		if (UEdGraphPin* KnotInputPin = KnotNode->GetInputPin())
+		{
+			return ConvertPureExpressionToLisp(KnotInputPin, Graph, Visited);
+		}
+	}
+
 	// Variable get
 
 	if (UK2Node_VariableGet* VarGet = Cast<UK2Node_VariableGet>(SourceNode))
+
 	{
 		FString VarName = VarGet->VariableReference.GetMemberName().ToString();
 		if (VarGet->VariableReference.IsLocalScope())
@@ -420,10 +457,18 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		}
 		Visited.Add(SourceNode);
 
+		if (FLispNodePtr LiteralBool = EXP_ConvertLiteralBoolCallToLisp(CallNode, Graph, Visited);
+			LiteralBool.IsValid() && !LiteralBool->IsNil())
+		{
+			Visited.Remove(SourceNode);
+			return LiteralBool;
+		}
+
 
 		FString FuncName = GetCleanNodeName(SourceNode);
 		TArray<FLispNodePtr> Args;
 		Args.Add(FLispNode::MakeSymbol(FuncName));
+
 
 		// Target object
 		UEdGraphPin* SelfPin = SourceNode->FindPin(UEdGraphSchema_K2::PN_Self, EGPD_Input);
@@ -701,11 +746,26 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 			if (Pin->Direction == EGPD_Output && Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
 			{
 				FLispNodePtr Body = ConvertExecChainToLisp(Pin, Graph, Visited, bPositions, ShortIds);
-				if (Body.IsValid() && !Body->IsNil()) Args.Add(Body);
+				if (!Body.IsValid() || Body->IsNil())
+				{
+					continue;
+				}
+				if (Body->IsForm(TEXT("seq")))
+				{
+					for (int32 BodyIdx = 1; BodyIdx < Body->Num(); ++BodyIdx)
+					{
+						Args.Add(Body->Get(BodyIdx));
+					}
+				}
+				else
+				{
+					Args.Add(Body);
+				}
 			}
 		}
 		return AppendNodeId(FLispNode::MakeList(Args), Node, ShortIds);
 	}
+
 
 	// ---- dynamic cast ----
 	if (UK2Node_DynamicCast* CastNode = Cast<UK2Node_DynamicCast>(Node))
@@ -890,7 +950,42 @@ static void AppendExecBodyToArgs(TArray<FLispNodePtr>& EventArgs, UEdGraphPin* E
 	}
 }
 
+static bool EXP_ShouldSkipCustomEventParamPin(UK2Node_CustomEvent* Event, UEdGraphPin* Pin)
+{
+	if (!Event || !Pin)
+	{
+		return true;
+	}
+	if (Pin->Direction != EGPD_Output || Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || Pin->bHidden)
+	{
+		return true;
+	}
+
+	const bool bIsImplicitDelegatePin = (Pin->PinName == UK2Node_Event::DelegateOutputName
+		&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Delegate);
+	if (!bIsImplicitDelegatePin)
+	{
+		return false;
+	}
+
+	for (UEdGraphPin* OtherPin : Event->Pins)
+	{
+		if (!OtherPin || OtherPin == Pin)
+		{
+			continue;
+		}
+		if (OtherPin->Direction != EGPD_Output || OtherPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec || OtherPin->bHidden)
+		{
+			continue;
+		}
+		return false;
+	}
+
+	return true;
+}
+
 // ----- Convert a standard K2Node_Event -----
+
 static FLispNodePtr ConvertEventToLisp(UK2Node_Event* Event, UEdGraph* Graph, bool bPositions,
 	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
 {
@@ -1058,15 +1153,17 @@ static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGrap
 	// Parameters
 	for (UEdGraphPin* Pin : Event->Pins)
 	{
-		if (Pin->Direction == EGPD_Output && Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		if (EXP_ShouldSkipCustomEventParamPin(Event, Pin))
 		{
-			EventArgs.Add(FLispNode::MakeKeyword(TEXT(":param")));
-			TArray<FLispNodePtr> ParamPair;
-			ParamPair.Add(FLispNode::MakeSymbol(Pin->PinName.ToString()));
-			ParamPair.Add(FLispNode::MakeSymbol(PinTypeToLispType(Pin->PinType)));
-			EventArgs.Add(FLispNode::MakeList(ParamPair));
+			continue;
 		}
+		EventArgs.Add(FLispNode::MakeKeyword(TEXT(":param")));
+		TArray<FLispNodePtr> ParamPair;
+		ParamPair.Add(FLispNode::MakeSymbol(Pin->PinName.ToString()));
+		ParamPair.Add(FLispNode::MakeSymbol(PinTypeToLispType(Pin->PinType)));
+		EventArgs.Add(FLispNode::MakeList(ParamPair));
 	}
+
 
 	UEdGraphPin* ThenPin = GetThenPin(Event);
 	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, Visited, bPositions, ShortNodeIds);
