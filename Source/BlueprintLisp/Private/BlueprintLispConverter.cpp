@@ -1426,8 +1426,11 @@ struct FBPImportContext
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph*   Graph     = nullptr;
+	FBlueprintLispConverter::EImportMode ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
 
 	TMap<FString, UEdGraphNode*> TempIdToNode;     // tempId / NodeGuid → node
+	TSet<FGuid> ConsumedRootEventGuids;
+
 	TMap<FString, FString>       VariableToNodeId; // var name → node GUID or _literal_ key
 	TMap<FString, FString>       VariableToPin;    // var name → pin name
 	TMap<FString, UFunction*>    FunctionCache;    // deterministic function lookup cache
@@ -1491,6 +1494,10 @@ static FString IMP_ExtractCallMacroName(const FLispNodePtr& Form, int32& OutArgS
 static UK2Node_MacroInstance* IMP_CreateMacroInstanceNode(const FLispNodePtr& Form, FBPImportContext& Ctx, UEdGraphPin*& OutPreferredOutputPin);
 static bool IMP_ExtractBindingNameAndValueIndex(const FLispNodePtr& Form, int32 StartIndex, FString& OutName, int32& OutValueIndex);
 static UScriptStruct* IMP_FindStructByName(const FString& StructName, FBPImportContext& Ctx);
+static FString IMP_GetAtomName(const FLispNodePtr& Node);
+static void IMP_EnsureGuid(UEdGraphNode* N);
+static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N);
+
 
 
 
@@ -1558,7 +1565,208 @@ static void IMP_ClearGraphForReplace(UEdGraph* Graph, EIMPGraphKind Kind)
 	}
 }
 
+static FString IMP_GetKeywordAtomValue(const FLispNodePtr& Form, const TCHAR* Keyword)
+{
+	if (!Form.IsValid() || !Form->IsList() || !Form->HasKeyword(Keyword))
+	{
+		return FString();
+	}
+	return IMP_GetAtomName(Form->GetKeywordArg(Keyword)).TrimStartAndEnd();
+}
+
+static void IMP_BuildStableIdIndex(const TArray<UEdGraphNode*>& Nodes, TMap<FString, UEdGraphNode*>& OutStableIdToNode)
+{
+	OutStableIdToNode.Reset();
+
+	TArray<FGuid> Guids;
+	TMap<FGuid, UEdGraphNode*> GuidToNode;
+	for (UEdGraphNode* Node : Nodes)
+	{
+		if (!Node)
+		{
+			continue;
+		}
+		IMP_EnsureGuid(Node);
+		if (!Node->NodeGuid.IsValid())
+		{
+			continue;
+		}
+		Guids.Add(Node->NodeGuid);
+		GuidToNode.Add(Node->NodeGuid, Node);
+	}
+
+	const TMap<FGuid, FString> ShortIds = ComputeShortIds(Guids);
+	for (const TPair<FGuid, FString>& Pair : ShortIds)
+	{
+		if (UEdGraphNode* const* FoundNode = GuidToNode.Find(Pair.Key))
+		{
+			OutStableIdToNode.Add(Pair.Value.ToLower(), *FoundNode);
+		}
+	}
+}
+
+static FString IMP_GetReusableEventName(UK2Node_Event* EventNode)
+{
+	if (!EventNode)
+	{
+		return FString();
+	}
+	if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(EventNode))
+	{
+		const FString CustomName = CustomEventNode->CustomFunctionName.ToString();
+		if (!CustomName.IsEmpty())
+		{
+			return CustomName;
+		}
+	}
+
+	FString EventName = EventNode->EventReference.GetMemberName().ToString();
+	if (EventName.IsEmpty())
+	{
+		EventName = EventNode->CustomFunctionName.ToString();
+	}
+	if (EventName.IsEmpty())
+	{
+		EventName = EventNode->GetNodeTitle(ENodeTitleType::ListView).ToString();
+	}
+	return EventName;
+}
+
+static bool IMP_IsCompatibleExistingEventNode(UK2Node_Event* Candidate, const FString& EventName, UFunction* EventSignatureFunc, bool bHasExplicitParams)
+{
+	if (!Candidate)
+	{
+		return false;
+	}
+
+	if (bHasExplicitParams)
+	{
+		if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(Candidate))
+		{
+			return CustomEventNode->CustomFunctionName.ToString().Equals(EventName, ESearchCase::IgnoreCase);
+		}
+		return false;
+	}
+
+	if (EventSignatureFunc)
+	{
+		if (Cast<UK2Node_CustomEvent>(Candidate))
+		{
+			return false;
+		}
+		const FString CandidateName = Candidate->EventReference.GetMemberName().ToString();
+		return CandidateName.Equals(EventSignatureFunc->GetName(), ESearchCase::IgnoreCase)
+			|| CandidateName.Equals(EventName, ESearchCase::IgnoreCase);
+	}
+
+	if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(Candidate))
+	{
+		return CustomEventNode->CustomFunctionName.ToString().Equals(EventName, ESearchCase::IgnoreCase);
+	}
+
+	return IMP_GetReusableEventName(Candidate).Equals(EventName, ESearchCase::IgnoreCase);
+}
+
+static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGraphNode*>& OutNodes)
+{
+	if (!ExecOutPin)
+	{
+		return;
+	}
+
+	for (UEdGraphPin* LinkedPin : ExecOutPin->LinkedTo)
+	{
+		UEdGraphNode* NextNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+		if (!NextNode || OutNodes.Contains(NextNode) || Cast<UK2Node_Event>(NextNode))
+		{
+			continue;
+		}
+
+		OutNodes.Add(NextNode);
+		for (UEdGraphPin* Pin : NextNode->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+			{
+				continue;
+			}
+			IMP_CollectDownstreamExecNodes(Pin, OutNodes);
+		}
+	}
+}
+
+static void IMP_ClearExistingEventExecChain(UK2Node_Event* EventNode, FBPImportContext& Ctx)
+{
+	if (!EventNode || !Ctx.Graph)
+	{
+		return;
+	}
+
+	TSet<UEdGraphNode*> NodesToRemove;
+	if (UEdGraphPin* ExecOutPin = IMP_GetExecOutput(EventNode))
+	{
+		IMP_CollectDownstreamExecNodes(ExecOutPin, NodesToRemove);
+		ExecOutPin->BreakAllPinLinks();
+	}
+
+	for (UEdGraphNode* Node : NodesToRemove)
+	{
+		Ctx.Graph->RemoveNode(Node);
+	}
+}
+
+static UK2Node_Event* IMP_FindReusableEventNode(const FLispNodePtr& EventForm, const FString& EventName, UFunction* EventSignatureFunc, bool bHasExplicitParams, FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph || Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		return nullptr;
+	}
+
+	TArray<UEdGraphNode*> ExistingEventNodes;
+	for (UEdGraphNode* Node : Ctx.Graph->Nodes)
+	{
+		if (UK2Node_Event* EventNode = Cast<UK2Node_Event>(Node))
+		{
+			if (!Ctx.ConsumedRootEventGuids.Contains(EventNode->NodeGuid))
+			{
+				ExistingEventNodes.Add(EventNode);
+			}
+		}
+	}
+
+	const FString RequestedEventId = IMP_GetKeywordAtomValue(EventForm, TEXT(":event-id")).ToLower();
+	if (!RequestedEventId.IsEmpty())
+	{
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(ExistingEventNodes, StableIdToNode);
+		if (UEdGraphNode* const* FoundNode = StableIdToNode.Find(RequestedEventId))
+		{
+			if (UK2Node_Event* MatchedById = Cast<UK2Node_Event>(*FoundNode))
+			{
+				if (IMP_IsCompatibleExistingEventNode(MatchedById, EventName, EventSignatureFunc, bHasExplicitParams))
+				{
+					return MatchedById;
+				}
+			}
+		}
+	}
+
+
+	for (UEdGraphNode* Node : ExistingEventNodes)
+	{
+		if (UK2Node_Event* Candidate = Cast<UK2Node_Event>(Node))
+		{
+			if (IMP_IsCompatibleExistingEventNode(Candidate, EventName, EventSignatureFunc, bHasExplicitParams))
+			{
+				return Candidate;
+			}
+		}
+	}
+
+	return nullptr;
+}
+
 static void IMP_CollectUnsupportedForms(const FLispNodePtr& Node, TSet<FString>& OutForms)
+
 {
 	if (!Node.IsValid() || !Node->IsList() || Node->Num() == 0) return;
 
@@ -4871,24 +5079,41 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 	UFunction* InterfaceFunc = (bHasExplicitParams || OverrideFunc) ? nullptr : IMP_FindImplementedInterfaceFunction(EventName, Ctx);
 	UFunction* EventSignatureFunc = OverrideFunc ? OverrideFunc : InterfaceFunc;
 
-	if (EventSignatureFunc)
+	EventNode = IMP_FindReusableEventNode(EventForm, EventName, EventSignatureFunc, bHasExplicitParams, Ctx);
+	const bool bReusedExistingEventNode = (EventNode != nullptr);
+	if (bReusedExistingEventNode)
+	{
+		IMP_ClearExistingEventExecChain(EventNode, Ctx);
+	}
+	else if (EventSignatureFunc)
 	{
 		EventNode = NewObject<UK2Node_Event>(Ctx.Graph);
 		EventNode->EventReference.SetFromField<UFunction>(EventSignatureFunc, false);
 		EventNode->bOverrideFunction = (OverrideFunc != nullptr);
+		EventNode->NodePosX = Ctx.CurrentX;
+		EventNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(EventNode, false, false);
+		EventNode->AllocateDefaultPins();
+		IMP_EnsureGuid(EventNode);
 	}
 	else
 	{
 		UK2Node_CustomEvent* CE = NewObject<UK2Node_CustomEvent>(Ctx.Graph);
 		CE->CustomFunctionName = FName(*EventName);
 		EventNode = CE;
+		EventNode->NodePosX = Ctx.CurrentX;
+		EventNode->NodePosY = Ctx.CurrentY;
+		Ctx.Graph->AddNode(EventNode, false, false);
+		EventNode->AllocateDefaultPins();
+		IMP_EnsureGuid(EventNode);
 	}
 
-
-	EventNode->NodePosX = Ctx.CurrentX; EventNode->NodePosY = Ctx.CurrentY;
-	Ctx.Graph->AddNode(EventNode, false, false);
-	EventNode->AllocateDefaultPins(); IMP_EnsureGuid(EventNode);
+	if (EventNode)
+	{
+		Ctx.ConsumedRootEventGuids.Add(EventNode->NodeGuid);
+	}
 	Ctx.AdvancePosition();
+
 
 	if (UK2Node_CustomEvent* CustomEventNode = Cast<UK2Node_CustomEvent>(EventNode))
 	{
@@ -5595,6 +5820,8 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	FBPImportContext Ctx;
 	Ctx.Blueprint = Blueprint;
 	Ctx.Graph     = Graph;
+	Ctx.ImportMode = Options.ImportMode;
+
 
 	if (Options.bFailOnUnsupportedForm && !IMP_ValidateImportCoverage(PR.Nodes, Ctx))
 	{
@@ -5904,8 +6131,10 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		FBPImportContext Ctx;
 		Ctx.Blueprint = BP;
 		Ctx.Graph     = Graph;
+		Ctx.ImportMode = Options.ImportMode;
 
 		IMP_EnsureFunctionEntryParamsFromFunctionForm(ExistingEntry, TopExpr, Ctx);
+
 		if (Ctx.Errors.Num() > 0)
 		{
 			return IMP_FailFromContext(Ctx, TEXT("ImportGraph function import failed"));
@@ -5985,8 +6214,10 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		FBPImportContext Ctx;
 		Ctx.Blueprint = BP;
 		Ctx.Graph     = Graph;
+		Ctx.ImportMode = Options.ImportMode;
 
 		FString EntryGuid = ExistingTunnel->NodeGuid.ToString();
+
 		Ctx.TempIdToNode.Add(EntryGuid, ExistingTunnel);
 
 		for (UEdGraphPin* P : ExistingTunnel->Pins)
