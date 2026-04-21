@@ -29,3 +29,14 @@ python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 ```
 
 如果需要，也可以直接在 `blueprintlisp_regression_manifest.json` 中填入 `editor_cmd` / `uproject`。
+
+另外，manifest 里的单个 case 也可以单独覆盖 `uproject` / `editor_cmd`。当前增量 EventGraph probe 就是这样做的：默认回归仍可跑 Cropout，而少数 AnimBP / ALS 定向用例会自动切到 `D:\MCP\MCP.uproject`。
+
+如果只想跑某一组 case，可以临时设置环境变量 `BLUEPRINTLISP_CASE_FILTER`，值为逗号分隔的 case id 列表。例如只跑新增的增量 EventGraph probe：
+
+```powershell
+$env:BLUEPRINTLISP_CASE_FILTER = "incremental_root_event_reuse,incremental_call_reuse,incremental_call_macro_reuse,incremental_set_branch_reuse,incremental_cast_reuse"
+python .\Tests\Regression\run_blueprintlisp_regression_suite.py
+```
+
+

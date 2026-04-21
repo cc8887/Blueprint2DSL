@@ -1765,8 +1765,112 @@ static void IMP_MarkReusableBodyNodeConsumed(UEdGraphNode* Node, FBPImportContex
 	Ctx.TempIdToNode.FindOrAdd(Node->NodeGuid.ToString()) = Node;
 }
 
+static UK2Node_IfThenElse* IMP_CreateOrReuseBranchNode(const FLispNodePtr& Form, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_IfThenElse* ReusableBranchNode = Cast<UK2Node_IfThenElse>(ReusableNode))
+		{
+			IMP_MarkReusableBodyNodeConsumed(ReusableBranchNode, Ctx);
+			Ctx.AdvancePosition();
+			return ReusableBranchNode;
+		}
+	}
+
+	UK2Node_IfThenElse* BranchNode = NewObject<UK2Node_IfThenElse>(Ctx.Graph);
+	BranchNode->NodePosX = Ctx.CurrentX;
+	BranchNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(BranchNode, false, false);
+	BranchNode->AllocateDefaultPins();
+	IMP_EnsureGuid(BranchNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), BranchNode);
+	Ctx.TempIdToNode.Add(BranchNode->NodeGuid.ToString(), BranchNode);
+	return BranchNode;
+}
+
+static bool IMP_IsCompatibleExistingVariableSetNode(UK2Node_VariableSet* VariableSetNode, const FString& RequestedVariableName)
+{
+	if (!VariableSetNode)
+	{
+		return false;
+	}
+
+	return VariableSetNode->VariableReference.GetMemberName().ToString().Equals(RequestedVariableName, ESearchCase::IgnoreCase);
+}
+
+static UK2Node_VariableSet* IMP_CreateOrReuseVariableSetNode(const FLispNodePtr& Form, const FString& VariableName, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_VariableSet* ReusableSetNode = Cast<UK2Node_VariableSet>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingVariableSetNode(ReusableSetNode, VariableName))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableSetNode, Ctx);
+				Ctx.AdvancePosition();
+				return ReusableSetNode;
+			}
+		}
+	}
+
+	UK2Node_VariableSet* VariableSetNode = NewObject<UK2Node_VariableSet>(Ctx.Graph);
+	VariableSetNode->VariableReference.SetSelfMember(FName(*VariableName));
+	VariableSetNode->NodePosX = Ctx.CurrentX;
+	VariableSetNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(VariableSetNode, false, false);
+	VariableSetNode->AllocateDefaultPins();
+	IMP_EnsureGuid(VariableSetNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), VariableSetNode);
+	Ctx.TempIdToNode.Add(VariableSetNode->NodeGuid.ToString(), VariableSetNode);
+	return VariableSetNode;
+}
+
+static bool IMP_IsCompatibleExistingDynamicCastNode(UK2Node_DynamicCast* DynamicCastNode, UClass* RequestedTargetClass)
+{
+	if (!DynamicCastNode || !RequestedTargetClass)
+	{
+		return false;
+	}
+
+	return DynamicCastNode->TargetType == RequestedTargetClass;
+}
+
+static UK2Node_DynamicCast* IMP_CreateOrReuseDynamicCastNode(const FLispNodePtr& Form, UClass* TargetClass, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (UK2Node_DynamicCast* ReusableCastNode = Cast<UK2Node_DynamicCast>(ReusableNode))
+		{
+			if (IMP_IsCompatibleExistingDynamicCastNode(ReusableCastNode, TargetClass))
+			{
+				IMP_MarkReusableBodyNodeConsumed(ReusableCastNode, Ctx);
+				ReusableCastNode->SetPurity(false);
+				Ctx.AdvancePosition();
+				return ReusableCastNode;
+			}
+		}
+	}
+
+	UK2Node_DynamicCast* DynamicCastNode = NewObject<UK2Node_DynamicCast>(Ctx.Graph);
+	DynamicCastNode->TargetType = TargetClass;
+	DynamicCastNode->NodePosX = Ctx.CurrentX;
+	DynamicCastNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(DynamicCastNode, false, false);
+	DynamicCastNode->SetPurity(false);
+	DynamicCastNode->AllocateDefaultPins();
+	IMP_EnsureGuid(DynamicCastNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), DynamicCastNode);
+	Ctx.TempIdToNode.Add(DynamicCastNode->NodeGuid.ToString(), DynamicCastNode);
+	return DynamicCastNode;
+}
+
 static FString IMP_GetExistingCallNodeName(UK2Node_CallFunction* CallNode)
 {
+
+
 	if (!CallNode)
 	{
 		return FString();
@@ -4682,10 +4786,9 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 	// (branch cond :true body :false body)
 	if (FormName.Equals(TEXT("branch"), ESearchCase::IgnoreCase))
 	{
-		UK2Node_IfThenElse* BN = NewObject<UK2Node_IfThenElse>(Ctx.Graph);
-		BN->NodePosX = Ctx.CurrentX; BN->NodePosY = Ctx.CurrentY;
-		Ctx.Graph->AddNode(BN, false, false); BN->AllocateDefaultPins(); Ctx.AdvancePosition();
+		UK2Node_IfThenElse* BN = IMP_CreateOrReuseBranchNode(Form, Ctx);
 		if (Form->Num() > 1)
+
 		{
 			UEdGraphPin* CondPin = BN->GetConditionPin();
 			UEdGraphPin* CondSrc = IMP_ResolveLispExpr(Form->Get(1), Ctx);
@@ -4727,18 +4830,10 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			return nullptr;
 		}
 
-		UK2Node_DynamicCast* CastNode = NewObject<UK2Node_DynamicCast>(Ctx.Graph);
-		CastNode->TargetType = TargetClass;
-		CastNode->NodePosX = Ctx.CurrentX;
-		CastNode->NodePosY = Ctx.CurrentY;
-		Ctx.Graph->AddNode(CastNode, false, false);
-		CastNode->SetPurity(false);
-		CastNode->AllocateDefaultPins();
-		IMP_EnsureGuid(CastNode);
-		Ctx.AdvancePosition();
-		Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CastNode);
+		UK2Node_DynamicCast* CastNode = IMP_CreateOrReuseDynamicCastNode(Form, TargetClass, Ctx);
 
 		if (UEdGraphPin* CastResultPin = CastNode->GetCastResultPin())
+
 		{
 			IMP_RegisterBoundValue(TEXT("K2Node_DynamicCast"), CastResultPin, Ctx);
 			IMP_RegisterBoundValue(CastResultPin->PinName.ToString(), CastResultPin, Ctx);
@@ -5016,12 +5111,9 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			Ctx.Errors.Add(TEXT("IMP: set missing variable name or value"));
 			return nullptr;
 		}
-		UK2Node_VariableSet* SN = NewObject<UK2Node_VariableSet>(Ctx.Graph);
-
-		SN->VariableReference.SetSelfMember(FName(*VarName));
-		SN->NodePosX = Ctx.CurrentX; SN->NodePosY = Ctx.CurrentY;
-		Ctx.Graph->AddNode(SN, false, false); SN->AllocateDefaultPins(); IMP_EnsureGuid(SN); Ctx.AdvancePosition();
+		UK2Node_VariableSet* SN = IMP_CreateOrReuseVariableSetNode(Form, VarName, Ctx);
 		for (UEdGraphPin* P : SN->Pins)
+
 			if (P->Direction == EGPD_Input && P->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
 				&& P->PinName != UEdGraphSchema_K2::PN_Self)
 			{ IMP_SetPinFromExpr(P, Form->Get(ValueIndex), Ctx); break; }
@@ -5246,9 +5338,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 
 		if (F)
 		{
-			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN); Ctx.AdvancePosition();
+			UK2Node_CallFunction* CN = IMP_CreateOrReuseCallFunctionNode(Form, F, FuncName, false, Ctx);
 			// Target object
 			if (UEdGraphPin* TargetPin = CN->FindPin(UEdGraphSchema_K2::PN_Self))
 			{
@@ -5256,10 +5346,10 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 				if (TargetSrc) IMP_Connect(TargetSrc, TargetPin, Ctx);
 			}
 			IMP_ApplyCallInputs(CN, Form, 3, false, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 			OutExecPin = IMP_GetExecOutput(CN);
 			return CN;
 		}
+
 
 		Ctx.Errors.Add(FString::Printf(TEXT("IMP: function not found: %s"), *FuncName));
 
@@ -5271,14 +5361,12 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 	{
 		if (UFunction* F = IMP_FindFunction(FormName, Ctx))
 		{
-			UK2Node_CallFunction* CN = NewObject<UK2Node_CallFunction>(Ctx.Graph);
-			CN->SetFromFunction(F); CN->NodePosX = Ctx.CurrentX; CN->NodePosY = Ctx.CurrentY;
-			Ctx.Graph->AddNode(CN, false, false); CN->AllocateDefaultPins(); IMP_EnsureGuid(CN); Ctx.AdvancePosition();
+			UK2Node_CallFunction* CN = IMP_CreateOrReuseCallFunctionNode(Form, F, FormName, false, Ctx);
 			IMP_ApplyCallInputs(CN, Form, 1, true, Ctx);
-			Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), CN);
 			OutExecPin = IMP_GetExecOutput(CN);
 			return CN;
 		}
+
 
 		if (UFunction* ParentFunc = IMP_FindParentFunction(FormName, Ctx))
 		{

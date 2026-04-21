@@ -7,3 +7,6 @@
 bp_player_edge_scroll_like_test_function_export.bplisp
 probe_*_export.bplisp
 roundtrip_*_edge_move_export.bplisp
+*_before_update.bplisp
+*_after_update.bplisp
+

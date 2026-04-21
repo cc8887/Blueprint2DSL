@@ -51,23 +51,34 @@ def build_status(expected_success, actual_success):
 def main():
     manifest = load_json(MANIFEST_PATH)
     default_timeout = int(manifest.get("default_timeout_seconds", 900))
-    editor_cmd = manifest.get("editor_cmd") or os.environ.get("BLUEPRINTLISP_EDITOR_CMD") or os.environ.get("UE_EDITOR_CMD")
-    uproject = manifest.get("uproject") or os.environ.get("BLUEPRINTLISP_UPROJECT") or os.environ.get("UE_UPROJECT_PATH")
-    if not editor_cmd:
+    default_editor_cmd = manifest.get("editor_cmd") or os.environ.get("BLUEPRINTLISP_EDITOR_CMD") or os.environ.get("UE_EDITOR_CMD")
+    default_uproject = manifest.get("uproject") or os.environ.get("BLUEPRINTLISP_UPROJECT") or os.environ.get("UE_UPROJECT_PATH")
+    if not default_editor_cmd:
         raise RuntimeError("缺少 editor_cmd，请在 manifest 中填写或设置环境变量 BLUEPRINTLISP_EDITOR_CMD")
-    if not uproject:
-        raise RuntimeError("缺少 uproject，请在 manifest 中填写或设置环境变量 BLUEPRINTLISP_UPROJECT")
 
     common_args = manifest.get("common_args", [])
+
     if not isinstance(common_args, list):
         raise RuntimeError("manifest.common_args 必须是数组")
     cases = manifest.get("cases", [])
+    case_filter_text = os.environ.get("BLUEPRINTLISP_CASE_FILTER", "").strip()
+    if case_filter_text:
+        requested_case_ids = [item.strip() for item in case_filter_text.split(",") if item.strip()]
+        requested_case_set = set(requested_case_ids)
+        cases = [case for case in cases if case.get("id") in requested_case_set]
+        if not cases:
+            raise RuntimeError(f"BLUEPRINTLISP_CASE_FILTER 未命中任何 case: {case_filter_text}")
+    else:
+        requested_case_ids = []
 
     suite_report = {
+
         "success": False,
         "suite_name": manifest.get("suite_name", "BlueprintLisp Regression Cases"),
         "manifest_path": MANIFEST_PATH,
+        "case_filter": requested_case_ids,
         "started_at_epoch": int(time.time()),
+
         "cases": [],
         "errors": [],
     }
@@ -85,9 +96,14 @@ def main():
         if not isinstance(extra_args, list):
             raise RuntimeError(f"case.extra_args 必须是数组: {case_id}")
 
+        case_editor_cmd = case.get("editor_cmd") or default_editor_cmd
+        case_uproject = case.get("uproject") or default_uproject
+        if not case_uproject:
+            raise RuntimeError(f"缺少 uproject，请在 manifest 顶层、case 内或环境变量 BLUEPRINTLISP_UPROJECT 中填写: {case_id}")
+
         command = [
-            editor_cmd,
-            uproject,
+            case_editor_cmd,
+            case_uproject,
             *common_args,
             *extra_args,
             "-run=pythonscript",
@@ -101,6 +117,7 @@ def main():
         ]
 
         case_report = {
+
             "id": case_id,
             "target": case.get("target", ""),
             "issue": case.get("issue", ""),
@@ -110,8 +127,11 @@ def main():
             "log_path": log_path,
             "expected_success": expected_success,
             "timeout_seconds": timeout_seconds,
+            "editor_cmd": case_editor_cmd,
+            "uproject": case_uproject,
             "command": command,
         }
+
 
         try:
             completed = subprocess.run(

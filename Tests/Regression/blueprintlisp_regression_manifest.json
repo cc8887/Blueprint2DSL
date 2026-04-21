@@ -76,6 +76,57 @@
       "target": "/Game/Blueprint/BPLispTests/BP_Player_EdgeScrollLike_Test :: WB_ApplyEdgeMoveLike",
       "issue": "FunctionGraph 中多输出 call-macro 在裸内联写法下曾误把 Direction 连到 ScaleValue，导致导入失败或退化为默认值",
       "notes": "要求 inline_double_call_macro 与显式 :out 版本都能成功导入，并回导出为同一份规范化结构。"
+    },
+    {
+      "id": "incremental_root_event_reuse",
+      "script_path": "incremental_root_event_reuse_probe.py",
+      "result_path": "incremental_root_event_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_RootEventReuseProbe :: EventGraph",
+      "issue": "MergeAppend update 路径下，根事件节点必须按 :event-id 复用，不能在每次 update 后漂移或回退重建。",
+      "notes": "脚本会先导出获取 event-id，再在保留 id 的 DSL 上做 update，要求 event-id 前后完全一致且不触发 ReplaceGraph fallback。"
+    },
+    {
+      "id": "incremental_call_reuse",
+      "script_path": "incremental_call_reuse_probe.py",
+      "result_path": "incremental_call_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CallReuseProbe :: EventGraph",
+      "issue": "EventGraph exporter 主路径生成的 shorthand call 过去虽带 :id，但 importer 主链路未消费，导致 update 时 call 节点 id 漂移。",
+      "notes": "要求 PrintString 的 :id 在 update 前后保持不变，且更新后的文本已生效。"
+    },
+    {
+      "id": "incremental_call_macro_reuse",
+      "script_path": "incremental_call_macro_reuse_probe.py",
+      "result_path": "incremental_call_macro_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CallMacroReuseProbe :: EventGraph",
+      "issue": "Macro instance 需要在 EventGraph update 中按稳定 :id 复用，不能每次重建新节点。",
+      "notes": "最小 probe 使用 call-macro IsValid，要求 call-macro 的 :id 在 update 前后完全一致。"
+    },
+    {
+      "id": "incremental_set_branch_reuse",
+      "script_path": "incremental_set_branch_reuse_probe.py",
+      "result_path": "incremental_set_branch_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_SetBranchReuseProbe :: EventGraph",
+      "issue": "set / branch 导出已带 :id，但 importer 过去仍直接 NewObject，导致 update 时节点 identity 漂移。",
+      "notes": "要求 JumpPlayRate 的 set 节点和 branch 节点在 update 前后保持同一份 :id，且值与分支文本都更新成功。"
+    },
+    {
+      "id": "incremental_cast_reuse",
+      "script_path": "incremental_cast_reuse_probe.py",
+      "result_path": "incremental_cast_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/AnimBP2FP/Phase5/ALS_AnimBP_CastReuseProbe :: EventGraph",
+      "issue": "dynamic cast 导出已带 :id，但 importer 过去没有目标类兼容检查与复用入口，update 时 cast 节点会漂移。",
+      "notes": "当前 probe 只检查 impure cast 主路径与 success body 的复用；要求 cast 的 :id 在 update 前后保持不变。"
     }
   ]
 }
+
