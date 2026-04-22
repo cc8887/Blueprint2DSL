@@ -119,7 +119,18 @@
       "notes": "最小 probe 在 PrintString 的 :instring 里嵌套 get-array-item(make-array ...)，要求 make-array 与 get-array-item 的 :id 在 update 前后保持不变，且数组元素更新成功。"
     },
     {
+      "id": "incremental_break_struct_reuse",
+      "script_path": "incremental_break_struct_reuse_probe.py",
+      "result_path": "incremental_break_struct_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_BreakStructReuseProbe :: EventGraph",
+      "issue": "break-struct 导出已带 :id，importer 也已有按 struct type 复用旧 UK2Node_BreakStruct 的入口，但还缺少专项证明 MergeAppend update 时能稳定复用并正确切换选中的输出 field。",
+      "notes": "最小 probe 在 PrintString 的 :duration 上连接 (break-struct :struct Vector :value (K2_GetActorLocation) :field X)；update 时只把 :field 从 X 改到 Y，要求 break-struct 的 :id 在 update 前后保持不变，且导出 field 已切到 Y。"
+    },
+    {
       "id": "incremental_generic_pure_enum_reuse",
+
       "script_path": "incremental_generic_pure_enum_reuse_probe.py",
       "result_path": "incremental_generic_pure_enum_reuse_probe_result.json",
       "expected_success": true,
