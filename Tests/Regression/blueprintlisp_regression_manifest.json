@@ -98,6 +98,18 @@
       "notes": "要求 PrintString 的 :id 在 update 前后保持不变，且更新后的文本已生效。"
     },
     {
+      "id": "incremental_pure_call_reuse",
+      "script_path": "incremental_pure_call_reuse_probe.py",
+      "result_path": "incremental_pure_call_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_PureCallReuseProbe :: EventGraph",
+      "issue": "pure call 导出链路补上 :id 后，MergeAppend update 仍需真正复用旧的 UK2Node_CallFunction，不能只在导出里有 identity。",
+      "notes": "最小 probe 在 PrintString 的输入参数上嵌一个 math pure call，要求 pure call 的 :id 在 update 前后保持不变，且更新值已生效。"
+
+    },
+
+    {
       "id": "incremental_call_macro_reuse",
       "script_path": "incremental_call_macro_reuse_probe.py",
       "result_path": "incremental_call_macro_reuse_probe_result.json",
