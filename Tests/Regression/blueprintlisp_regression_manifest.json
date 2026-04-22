@@ -118,9 +118,21 @@
       "issue": "make-array / get-array-item 虽已具备 pure stable-id 导出与 importer 复用入口，但仍需专项证明 MergeAppend update 时不会漂移或退化重建。",
       "notes": "最小 probe 在 PrintString 的 :instring 里嵌套 get-array-item(make-array ...)，要求 make-array 与 get-array-item 的 :id 在 update 前后保持不变，且数组元素更新成功。"
     },
+    {
+      "id": "incremental_generic_pure_enum_reuse",
+      "script_path": "incremental_generic_pure_enum_reuse_probe.py",
+      "result_path": "incremental_generic_pure_enum_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_GenericPureEnumReuseProbe :: EventGraph",
+      "issue": "generic pure node 导出虽已能把 enum compare 之类节点写成 (!= ...) / (== ...) 并带 :id，但主导入路径过去没有对应复用入口，导致 MergeAppend update 时无法稳定消费这类 pure K2Node。",
+      "notes": "最小 probe 现改为新建 ALS_Base_CharacterBP 的子蓝图，直接复用继承来的 MovementState 枚举属性，在 branch 条件里使用 (!= (self.MovementState) \"NewEnumerator3\")；要求 generic pure enum compare 的 :id 在 update 前后保持不变，且枚举字面量能更新到 NewEnumerator2。"
+
+    },
 
     {
       "id": "incremental_call_macro_reuse",
+
 
       "script_path": "incremental_call_macro_reuse_probe.py",
       "result_path": "incremental_call_macro_reuse_probe_result.json",

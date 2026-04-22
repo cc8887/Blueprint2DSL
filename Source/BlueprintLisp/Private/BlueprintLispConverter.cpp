@@ -2381,7 +2381,52 @@ static UK2Node_BreakStruct* IMP_CreateOrReuseBreakStructNode(const FLispNodePtr&
 	return BreakNode;
 }
 
+static bool IMP_IsCompatibleExistingEnumCompareNode(UEdGraphNode* Node, bool bRequestedEquality)
+{
+	if (!Node)
+	{
+		return false;
+	}
+
+	return bRequestedEquality
+		? Cast<UK2Node_EnumEquality>(Node) != nullptr
+		: Cast<UK2Node_EnumInequality>(Node) != nullptr;
+}
+
+static UK2Node* IMP_CreateOrReuseEnumCompareNode(const FLispNodePtr& Form, bool bRequestedEquality, FBPImportContext& Ctx)
+{
+	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
+	{
+		if (IMP_IsCompatibleExistingEnumCompareNode(ReusableNode, bRequestedEquality))
+		{
+			IMP_MarkReusableBodyNodeConsumed(ReusableNode, Ctx);
+			Ctx.AdvancePosition();
+			Ctx.TempIdToNode.FindOrAdd(ReusableNode->NodeGuid.ToString()) = ReusableNode;
+			return Cast<UK2Node>(ReusableNode);
+		}
+	}
+
+	UK2Node* EnumCompareNode = bRequestedEquality
+		? Cast<UK2Node>(NewObject<UK2Node_EnumEquality>(Ctx.Graph))
+		: Cast<UK2Node>(NewObject<UK2Node_EnumInequality>(Ctx.Graph));
+	if (!EnumCompareNode)
+	{
+		return nullptr;
+	}
+
+	EnumCompareNode->NodePosX = Ctx.CurrentX;
+	EnumCompareNode->NodePosY = Ctx.CurrentY;
+	Ctx.Graph->AddNode(EnumCompareNode, false, false);
+	EnumCompareNode->AllocateDefaultPins();
+	IMP_EnsureGuid(EnumCompareNode);
+	Ctx.AdvancePosition();
+	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), EnumCompareNode);
+	Ctx.TempIdToNode.Add(EnumCompareNode->NodeGuid.ToString(), EnumCompareNode);
+	return EnumCompareNode;
+}
+
 static FString IMP_GetReusableEventName(UK2Node_Event* EventNode)
+
 
 
 {
@@ -5515,7 +5560,41 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 
 	}
 
+	if (FormName.Equals(TEXT("=="), ESearchCase::CaseSensitive) || FormName.Equals(TEXT("!="), ESearchCase::CaseSensitive))
+	{
+		const bool bRequestedEquality = FormName.Equals(TEXT("=="), ESearchCase::CaseSensitive);
+		if (UK2Node* EnumCompareNode = IMP_CreateOrReuseEnumCompareNode(Expr, bRequestedEquality, Ctx))
+		{
+			int32 ArgIndex = 1;
+			int32 DataPinIndex = 0;
+			for (UEdGraphPin* Pin : EnumCompareNode->Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Input) continue;
+				if (Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec) continue;
+				if (ArgIndex >= Expr->Num()) break;
+
+				FLispNodePtr ArgExpr = Expr->Get(ArgIndex);
+				if (ArgExpr->IsKeyword())
+				{
+					ArgIndex++;
+					if (ArgIndex >= Expr->Num()) break;
+					ArgExpr = Expr->Get(ArgIndex);
+				}
+
+				IMP_SetPinFromExpr(Pin, ArgExpr, Ctx);
+				ArgIndex++;
+				DataPinIndex++;
+				if (DataPinIndex >= 2) break;
+			}
+
+			Ctx.TempIdToNode.FindOrAdd(EnumCompareNode->NodeGuid.ToString()) = EnumCompareNode;
+			return IMP_FindOutputPin(EnumCompareNode, TEXT(""));
+		}
+		return nullptr;
+	}
+
 	// Generic function call / pure expr: (FuncName [self] [:pin value]...)
+
 	int32 CompoundArgStartIndex = 1;
 	const FString CompoundFormName = IMP_ExtractCompoundName(Expr, 0, CompoundArgStartIndex);
 	if (Expr->Num() == 1 && CompoundFormName.StartsWith(TEXT("self."), ESearchCase::IgnoreCase))
