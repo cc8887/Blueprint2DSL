@@ -108,9 +108,20 @@
       "notes": "最小 probe 在 PrintString 的输入参数上嵌一个 math pure call，要求 pure call 的 :id 在 update 前后保持不变，且更新值已生效。"
 
     },
+    {
+      "id": "incremental_pure_array_reuse",
+      "script_path": "incremental_pure_array_reuse_probe.py",
+      "result_path": "incremental_pure_array_reuse_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_PureArrayReuseProbe :: EventGraph",
+      "issue": "make-array / get-array-item 虽已具备 pure stable-id 导出与 importer 复用入口，但仍需专项证明 MergeAppend update 时不会漂移或退化重建。",
+      "notes": "最小 probe 在 PrintString 的 :instring 里嵌套 get-array-item(make-array ...)，要求 make-array 与 get-array-item 的 :id 在 update 前后保持不变，且数组元素更新成功。"
+    },
 
     {
       "id": "incremental_call_macro_reuse",
+
       "script_path": "incremental_call_macro_reuse_probe.py",
       "result_path": "incremental_call_macro_reuse_probe_result.json",
       "expected_success": true,
