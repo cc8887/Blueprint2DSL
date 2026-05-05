@@ -194,6 +194,16 @@ public:
 	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
 	static FBlueprintLispPythonResult ListGraphs(const FString& BlueprintPath);
 
+	/**
+	 * Inspect a Blueprint member variable and return a JSON payload in DSLText.
+	 * Payload fields currently include: variable_name, declared_on_target_blueprint,
+	 * default_value, has_expose_on_spawn, owner_blueprint_path.
+	 */
+	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
+	static FBlueprintLispPythonResult InspectMemberVariable(
+		const FString& BlueprintPath,
+		const FString& VariableName);
+
 	// ---------------------------------------------------------------
 	// Validation
 	// ---------------------------------------------------------------

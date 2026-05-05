@@ -12,7 +12,12 @@
 #include "Misc/FileHelper.h"
 #include "Misc/PackageName.h"
 #include "Misc/Paths.h"
+#include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
+#include "EdGraphSchema_K2.h"
+#include "Dom/JsonObject.h"
+#include "Serialization/JsonSerializer.h"
+#include "Serialization/JsonWriter.h"
 
 
 namespace BPLispBridge
@@ -382,6 +387,80 @@ FBlueprintLispPythonResult UBlueprintLispPythonBridge::ListGraphs(const FString&
 	Result.Message = FString::Printf(TEXT("Found %d graphs in %s"),
 		BP->UbergraphPages.Num() + BP->FunctionGraphs.Num() + BP->MacroGraphs.Num(),
 		*ResolvedPath);
+	return Result;
+}
+
+FBlueprintLispPythonResult UBlueprintLispPythonBridge::InspectMemberVariable(const FString& BlueprintPath, const FString& VariableName)
+{
+	const FString TrimmedVariableName = VariableName.TrimStartAndEnd();
+	if (TrimmedVariableName.IsEmpty())
+	{
+		return BPLispBridge::MakeFailure(TEXT("VariableName is empty"));
+	}
+
+	FString ResolvedPath;
+	FString Error;
+	UBlueprint* BP = BPLispBridge::LoadBlueprintByPath(BlueprintPath, ResolvedPath, Error);
+	if (!BP)
+	{
+		return BPLispBridge::MakeFailure(Error);
+	}
+
+	const FName VariableFName(*TrimmedVariableName);
+	UBlueprint* OwnerBlueprint = BP;
+	const int32 NewVarIndex = FBlueprintEditorUtils::FindNewVariableIndexAndBlueprint(BP, VariableFName, OwnerBlueprint);
+	const bool bHasVariableDescription = OwnerBlueprint && NewVarIndex != INDEX_NONE && OwnerBlueprint->NewVariables.IsValidIndex(NewVarIndex);
+
+	const FProperty* VariableProperty = nullptr;
+	auto TryResolveProperty = [&VariableProperty, &VariableFName](const UClass* InClass) -> bool
+	{
+		if (!InClass)
+		{
+			return false;
+		}
+		VariableProperty = InClass->FindPropertyByName(VariableFName);
+		return VariableProperty != nullptr;
+	};
+
+	const bool bFoundProperty = TryResolveProperty(BP->SkeletonGeneratedClass)
+		|| TryResolveProperty(BP->GeneratedClass)
+		|| TryResolveProperty(BP->ParentClass);
+	if (!bHasVariableDescription && !bFoundProperty)
+	{
+		return BPLispBridge::MakeFailure(FString::Printf(TEXT("Failed to find variable '%s' in %s"), *TrimmedVariableName, *ResolvedPath));
+	}
+
+	const bool bDeclaredOnTargetBlueprint = bHasVariableDescription && OwnerBlueprint == BP;
+	const FString DefaultValue = bHasVariableDescription ? OwnerBlueprint->NewVariables[NewVarIndex].DefaultValue : FString();
+
+	FString ExposeOnSpawnValue;
+	const bool bHasExposeOnSpawn = FBlueprintEditorUtils::GetBlueprintVariableMetaData(
+		BP,
+		VariableFName,
+		nullptr,
+		FBlueprintMetadata::MD_ExposeOnSpawn,
+		ExposeOnSpawnValue) && ExposeOnSpawnValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("variable_name"), TrimmedVariableName);
+	Payload->SetBoolField(TEXT("declared_on_target_blueprint"), bDeclaredOnTargetBlueprint);
+	Payload->SetStringField(TEXT("owner_blueprint_path"), OwnerBlueprint ? OwnerBlueprint->GetPathName() : FString());
+	Payload->SetStringField(TEXT("default_value"), DefaultValue);
+	Payload->SetBoolField(TEXT("has_expose_on_spawn"), bHasExposeOnSpawn);
+	if (VariableProperty)
+	{
+		Payload->SetStringField(TEXT("property_class"), VariableProperty->GetClass()->GetName());
+	}
+
+	FString PayloadText;
+	TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&PayloadText);
+	FJsonSerializer::Serialize(Payload, JsonWriter);
+
+	FBlueprintLispPythonResult Result;
+	Result.bSuccess = true;
+	Result.AssetPath = ResolvedPath;
+	Result.DSLText = PayloadText;
+	Result.Message = FString::Printf(TEXT("Inspected variable '%s' in %s"), *TrimmedVariableName, *ResolvedPath);
 	return Result;
 }
 

@@ -252,6 +252,16 @@
       "target": "/Game/Blueprint/BPLispTests/BP_Player_MacroExitGenericReuseProbe :: Villager Overlap Check",
       "issue": "macro body 里的 generic fallback 与 exit 过去虽然可被 update 命中，但 exit tunnel 会在 finalize 阶段被误删或导出时丢失 :id。",
       "notes": "probe 复制 BP_Player 的 Villager Overlap Check 宏图，要求 generic fallback 与 exit 的 :id 在 update 前后都保持一致，且不触发 ReplaceGraph fallback。"
+    },
+    {
+      "id": "import_var_declaration_auto_create",
+      "script_path": "import_var_declaration_probe.py",
+      "result_path": "import_var_declaration_probe_result.json",
+      "expected_success": true,
+      "uproject": "D:\\MCP\\MCP.uproject",
+      "target": "/Game/Blueprint/BPLispTests/BP_VarDeclarationProbe :: EventGraph",
+      "issue": "顶层 var 过去只在 Validate 白名单里保留，但 import 不会自动创建 Blueprint 成员变量，也不支持在声明阶段写入默认值或 ExposeOnSpawn。",
+      "notes": "probe 在全新 Character 蓝图上导入 `(var AutoCreatedHealth float :default 42 :expose-on-spawn true)`，验证成员变量被创建、默认值和 ExposeOnSpawn 元数据生效、graph 里的 set 赋值可编译导出；再导入同名 bool 声明，要求失败且变量定义与图内容保持第一次成功导入后的状态。"
     }
   ]
 }

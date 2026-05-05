@@ -1535,6 +1535,26 @@ static UK2Node_MacroInstance* IMP_CreateMacroInstanceNode(const FLispNodePtr& Fo
 static bool IMP_ExtractBindingNameAndValueIndex(const FLispNodePtr& Form, int32 StartIndex, FString& OutName, int32& OutValueIndex);
 static UScriptStruct* IMP_FindStructByName(const FString& StructName, FBPImportContext& Ctx);
 static FString IMP_GetAtomName(const FLispNodePtr& Node);
+static bool IMP_ArePinTypesEquivalent(const FEdGraphPinType& A, const FEdGraphPinType& B);
+static bool IMP_TryGetExistingBlueprintVariableType(UBlueprint* Blueprint, const FName& VarName, FEdGraphPinType& OutPinType);
+
+struct FIMPBlueprintVariableImportSpec
+{
+	FString VarName;
+	FString TypeName;
+	FEdGraphPinType RequestedPinType;
+	bool bHasDefaultValue = false;
+	FString DefaultValue;
+	bool bHasExposeOnSpawn = false;
+	bool bExposeOnSpawn = false;
+};
+
+static bool IMP_TryParseBoolLiteral(const FLispNodePtr& Node, bool& OutValue);
+static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarName, const FLispNodePtr& Expr, const FEdGraphPinType& PinType, FString& OutDefaultValue, FBPImportContext& Ctx);
+static bool IMP_TryParseBlueprintVariableImportSpec(const FLispNodePtr& Form, FIMPBlueprintVariableImportSpec& OutSpec, FBPImportContext& Ctx);
+static bool IMP_TryFindOwnedBlueprintVariable(UBlueprint* Blueprint, const FName& VarName, UBlueprint*& OutOwnerBlueprint, int32& OutVarIndex);
+static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImportSpec& Spec, FBPImportContext& Ctx);
+static void IMP_EnsureBlueprintVariablesFromTopLevelForms(const TArray<FLispNodePtr>& Nodes, FBPImportContext& Ctx);
 static void IMP_EnsureGuid(UEdGraphNode* N);
 static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N);
 static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGraphNode*>& OutNodes);
@@ -4727,6 +4747,368 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 	return false;
 }
 
+static bool IMP_ArePinTypesEquivalent(const FEdGraphPinType& A, const FEdGraphPinType& B)
+{
+	if (const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>())
+	{
+		return K2Schema->ArePinTypesEquivalent(A, B);
+	}
+	return false;
+}
+
+static bool IMP_TryGetExistingBlueprintVariableType(UBlueprint* Blueprint, const FName& VarName, FEdGraphPinType& OutPinType)
+{
+	if (!Blueprint || VarName.IsNone())
+	{
+		return false;
+	}
+
+	UBlueprint* OwnerBlueprint = Blueprint;
+	const int32 NewVarIndex = FBlueprintEditorUtils::FindNewVariableIndexAndBlueprint(Blueprint, VarName, OwnerBlueprint);
+	if (OwnerBlueprint && NewVarIndex != INDEX_NONE && OwnerBlueprint->NewVariables.IsValidIndex(NewVarIndex))
+	{
+		OutPinType = OwnerBlueprint->NewVariables[NewVarIndex].VarType;
+		return true;
+	}
+
+	const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>();
+	if (!K2Schema)
+	{
+		return false;
+	}
+
+	auto TryResolveFromClass = [&OutPinType, &VarName, K2Schema](const UClass* InClass) -> bool
+	{
+		if (!InClass)
+		{
+			return false;
+		}
+		if (const FProperty* ExistingProperty = InClass->FindPropertyByName(VarName))
+		{
+			return K2Schema->ConvertPropertyToPinType(ExistingProperty, OutPinType);
+		}
+		return false;
+	};
+
+	return TryResolveFromClass(Blueprint->SkeletonGeneratedClass)
+		|| TryResolveFromClass(Blueprint->GeneratedClass)
+		|| TryResolveFromClass(Blueprint->ParentClass);
+}
+
+static bool IMP_TryParseBoolLiteral(const FLispNodePtr& Node, bool& OutValue)
+{
+	if (!Node.IsValid() || Node->IsNil())
+	{
+		return false;
+	}
+
+	if (Node->IsSymbol() || Node->IsString() || Node->IsKeyword())
+	{
+		const FString Value = Node->StringValue;
+		if (Value.Equals(TEXT("true"), ESearchCase::IgnoreCase))
+		{
+			OutValue = true;
+			return true;
+		}
+		if (Value.Equals(TEXT("false"), ESearchCase::IgnoreCase))
+		{
+			OutValue = false;
+			return true;
+		}
+	}
+
+	if (Node->IsNumber())
+	{
+		if (FMath::IsNearlyZero(Node->NumberValue))
+		{
+			OutValue = false;
+			return true;
+		}
+		if (FMath::IsNearlyEqual(Node->NumberValue, 1.0))
+		{
+			OutValue = true;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarName, const FLispNodePtr& Expr, const FEdGraphPinType& PinType, FString& OutDefaultValue, FBPImportContext& Ctx)
+{
+	OutDefaultValue.Reset();
+	if (!Expr.IsValid() || Expr->IsNil())
+	{
+		return true;
+	}
+
+	const FName PinCategory = PinType.PinCategory;
+	if (Expr->IsNumber())
+	{
+		if (PinCategory == UEdGraphSchema_K2::PC_Int || PinCategory == UEdGraphSchema_K2::PC_Int64 || PinCategory == UEdGraphSchema_K2::PC_Byte)
+		{
+			const int64 RoundedValue = FMath::RoundToInt64(Expr->NumberValue);
+			if (!FMath::IsNearlyEqual(Expr->NumberValue, static_cast<double>(RoundedValue)))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: :default for '%s' must be an integer literal"), *VarName));
+				return false;
+			}
+			OutDefaultValue = LexToString(RoundedValue);
+			return true;
+		}
+		if (PinCategory == UEdGraphSchema_K2::PC_Real || PinCategory == UEdGraphSchema_K2::PC_Float || PinCategory == UEdGraphSchema_K2::PC_Double)
+		{
+			OutDefaultValue = FString::SanitizeFloat(Expr->NumberValue);
+			return true;
+		}
+
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: numeric :default is unsupported for variable '%s' of type '%s'"), *VarName, *PinTypeToLispType(PinType)));
+		return false;
+	}
+
+	if (Expr->IsString())
+	{
+		if (PinCategory == UEdGraphSchema_K2::PC_String || PinCategory == UEdGraphSchema_K2::PC_Name || PinCategory == UEdGraphSchema_K2::PC_Text)
+		{
+			OutDefaultValue = Expr->StringValue;
+			return true;
+		}
+		if (PinCategory == UEdGraphSchema_K2::PC_Byte && PinType.PinSubCategoryObject.IsValid() && Cast<UEnum>(PinType.PinSubCategoryObject.Get()))
+		{
+			OutDefaultValue = Expr->StringValue;
+			return true;
+		}
+
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: string :default is unsupported for variable '%s' of type '%s'"), *VarName, *PinTypeToLispType(PinType)));
+		return false;
+	}
+
+	if (Expr->IsSymbol() || Expr->IsKeyword())
+	{
+		const FString SymbolValue = Expr->StringValue;
+		if (SymbolValue.Equals(TEXT("nil"), ESearchCase::IgnoreCase))
+		{
+			return true;
+		}
+
+		if (PinCategory == UEdGraphSchema_K2::PC_Boolean)
+		{
+			bool bDefaultBool = false;
+			if (!IMP_TryParseBoolLiteral(Expr, bDefaultBool))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: :default for '%s' must be true/false"), *VarName));
+				return false;
+			}
+			OutDefaultValue = bDefaultBool ? TEXT("true") : TEXT("false");
+			return true;
+		}
+
+		if (PinCategory == UEdGraphSchema_K2::PC_String || PinCategory == UEdGraphSchema_K2::PC_Name || PinCategory == UEdGraphSchema_K2::PC_Text)
+		{
+			OutDefaultValue = SymbolValue;
+			return true;
+		}
+		if (PinCategory == UEdGraphSchema_K2::PC_Byte && PinType.PinSubCategoryObject.IsValid() && Cast<UEnum>(PinType.PinSubCategoryObject.Get()))
+		{
+			OutDefaultValue = SymbolValue;
+			return true;
+		}
+	}
+
+	Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: unsupported :default literal for variable '%s' of type '%s'"), *VarName, *PinTypeToLispType(PinType)));
+	return false;
+}
+
+static bool IMP_TryParseBlueprintVariableImportSpec(const FLispNodePtr& Form, FIMPBlueprintVariableImportSpec& OutSpec, FBPImportContext& Ctx)
+{
+	OutSpec = FIMPBlueprintVariableImportSpec();
+	if (!Form.IsValid() || !Form->IsList() || Form->Num() < 3)
+	{
+		Ctx.Errors.Add(TEXT("Import var form failed: expected (var Name Type [:default Literal] [:expose-on-spawn Bool])"));
+		return false;
+	}
+
+	OutSpec.VarName = IMP_GetAtomName(Form->Get(1));
+	OutSpec.TypeName = IMP_GetAtomName(Form->Get(2));
+	if (OutSpec.VarName.IsEmpty() || OutSpec.TypeName.IsEmpty())
+	{
+		Ctx.Errors.Add(TEXT("Import var form failed: variable name or type is empty"));
+		return false;
+	}
+
+	if (!IMP_BuildPinTypeFromLispType(OutSpec.TypeName, OutSpec.RequestedPinType, Ctx))
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: unsupported variable type '%s' for '%s'"), *OutSpec.TypeName, *OutSpec.VarName));
+		return false;
+	}
+
+	for (int32 ArgIndex = 3; ArgIndex < Form->Num(); ArgIndex += 2)
+	{
+		if (ArgIndex + 1 >= Form->Num())
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: option '%s' is missing a value"), *IMP_GetAtomName(Form->Get(ArgIndex))));
+			return false;
+		}
+
+		const FLispNodePtr KeywordNode = Form->Get(ArgIndex);
+		if (!KeywordNode.IsValid() || !KeywordNode->IsKeyword())
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: '%s' expects keyword/value options after the type"), *OutSpec.VarName));
+			return false;
+		}
+
+		const FString Keyword = KeywordNode->StringValue;
+		const FLispNodePtr ValueNode = Form->Get(ArgIndex + 1);
+		if (Keyword.Equals(TEXT(":default"), ESearchCase::IgnoreCase))
+		{
+			if (OutSpec.bHasDefaultValue)
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: duplicate :default for '%s'"), *OutSpec.VarName));
+				return false;
+			}
+			if (!IMP_TryBuildBlueprintVariableDefaultValueString(OutSpec.VarName, ValueNode, OutSpec.RequestedPinType, OutSpec.DefaultValue, Ctx))
+			{
+				return false;
+			}
+			OutSpec.bHasDefaultValue = true;
+			continue;
+		}
+		if (Keyword.Equals(TEXT(":expose-on-spawn"), ESearchCase::IgnoreCase))
+		{
+			if (OutSpec.bHasExposeOnSpawn)
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: duplicate :expose-on-spawn for '%s'"), *OutSpec.VarName));
+				return false;
+			}
+			if (!IMP_TryParseBoolLiteral(ValueNode, OutSpec.bExposeOnSpawn))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: :expose-on-spawn for '%s' must be true/false"), *OutSpec.VarName));
+				return false;
+			}
+			OutSpec.bHasExposeOnSpawn = true;
+			continue;
+		}
+
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: unsupported option '%s' for '%s'"), *Keyword, *OutSpec.VarName));
+		return false;
+	}
+
+	return true;
+}
+
+static bool IMP_TryFindOwnedBlueprintVariable(UBlueprint* Blueprint, const FName& VarName, UBlueprint*& OutOwnerBlueprint, int32& OutVarIndex)
+{
+	OutOwnerBlueprint = Blueprint;
+	OutVarIndex = FBlueprintEditorUtils::FindNewVariableIndexAndBlueprint(Blueprint, VarName, OutOwnerBlueprint);
+	return OutOwnerBlueprint && OutVarIndex != INDEX_NONE && OutOwnerBlueprint->NewVariables.IsValidIndex(OutVarIndex);
+}
+
+static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImportSpec& Spec, FBPImportContext& Ctx)
+{
+	if (!Ctx.Blueprint || (!Spec.bHasDefaultValue && !Spec.bHasExposeOnSpawn))
+	{
+		return true;
+	}
+
+	UBlueprint* OwnerBlueprint = nullptr;
+	int32 VarIndex = INDEX_NONE;
+	if (!IMP_TryFindOwnedBlueprintVariable(Ctx.Blueprint, FName(*Spec.VarName), OwnerBlueprint, VarIndex) || OwnerBlueprint != Ctx.Blueprint)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: variable '%s' is not declared on the target Blueprint, so top-level var options cannot be applied"), *Spec.VarName));
+		return false;
+	}
+
+	bool bModified = false;
+	FBPVariableDescription& VariableDesc = Ctx.Blueprint->NewVariables[VarIndex];
+	if (Spec.bHasDefaultValue && VariableDesc.DefaultValue != Spec.DefaultValue)
+	{
+		Ctx.Blueprint->Modify();
+		VariableDesc.DefaultValue = Spec.DefaultValue;
+		bModified = true;
+	}
+
+	if (Spec.bHasExposeOnSpawn)
+	{
+		FString ExistingExposeOnSpawnValue;
+		const bool bHadExposeOnSpawnMeta = FBlueprintEditorUtils::GetBlueprintVariableMetaData(
+			Ctx.Blueprint,
+			FName(*Spec.VarName),
+			nullptr,
+			FBlueprintMetadata::MD_ExposeOnSpawn,
+			ExistingExposeOnSpawnValue);
+		const bool bCurrentlyExposeOnSpawn = bHadExposeOnSpawnMeta && ExistingExposeOnSpawnValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
+		if (Spec.bExposeOnSpawn != bCurrentlyExposeOnSpawn || (!Spec.bExposeOnSpawn && bHadExposeOnSpawnMeta))
+		{
+			if (Spec.bExposeOnSpawn)
+			{
+				FBlueprintEditorUtils::SetBlueprintVariableMetaData(Ctx.Blueprint, FName(*Spec.VarName), nullptr, FBlueprintMetadata::MD_ExposeOnSpawn, TEXT("true"));
+			}
+			else
+			{
+				FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(Ctx.Blueprint, FName(*Spec.VarName), nullptr, FBlueprintMetadata::MD_ExposeOnSpawn);
+			}
+			bModified = true;
+		}
+	}
+
+	if (bModified)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.Blueprint);
+	}
+	return true;
+}
+
+static void IMP_EnsureBlueprintVariablesFromTopLevelForms(const TArray<FLispNodePtr>& Nodes, FBPImportContext& Ctx)
+{
+	if (!Ctx.Blueprint)
+	{
+		return;
+	}
+
+	for (const FLispNodePtr& Form : Nodes)
+	{
+		if (!Form.IsValid() || !Form->IsList() || Form->Num() == 0)
+		{
+			continue;
+		}
+
+		if (!Form->GetFormName().Equals(TEXT("var"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+
+		FIMPBlueprintVariableImportSpec Spec;
+		if (!IMP_TryParseBlueprintVariableImportSpec(Form, Spec, Ctx))
+		{
+			continue;
+		}
+
+		FEdGraphPinType ExistingPinType;
+		if (IMP_TryGetExistingBlueprintVariableType(Ctx.Blueprint, FName(*Spec.VarName), ExistingPinType))
+		{
+			if (!IMP_ArePinTypesEquivalent(ExistingPinType, Spec.RequestedPinType))
+			{
+				Ctx.Errors.Add(FString::Printf(
+					TEXT("Import var form failed: variable '%s' already exists with type '%s', requested '%s'"),
+					*Spec.VarName,
+					*PinTypeToLispType(ExistingPinType),
+					*PinTypeToLispType(Spec.RequestedPinType)));
+				continue;
+			}
+
+			IMP_ApplyBlueprintVariableImportSpec(Spec, Ctx);
+			continue;
+		}
+
+		if (!FBlueprintEditorUtils::AddMemberVariable(Ctx.Blueprint, FName(*Spec.VarName), Spec.RequestedPinType, Spec.bHasDefaultValue ? Spec.DefaultValue : FString()))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: could not create variable '%s'"), *Spec.VarName));
+			continue;
+		}
+
+		IMP_ApplyBlueprintVariableImportSpec(Spec, Ctx);
+	}
+}
 
 static void IMP_EnsureFunctionEntryParamsFromFunctionForm(UK2Node_FunctionEntry* ExistingEntry, const FLispNodePtr& Form, FBPImportContext& Ctx)
 {
@@ -7146,6 +7528,12 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 		return FBlueprintLispResult::Fail(Ctx.Errors.Num() > 0 ? Ctx.Errors[0] : TEXT("Import aborted due to unsupported DSL forms"));
 	}
 
+	IMP_EnsureBlueprintVariablesFromTopLevelForms(PR.Nodes, Ctx);
+	if (Ctx.Errors.Num() > 0)
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import var declaration failed"));
+	}
+
 	if (Options.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
 	{
 		IMP_ClearGraphForReplace(Graph, IMP_DetectGraphKind(Graph));
@@ -7371,6 +7759,12 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 
 			}
 		}
+		else if (FormName.Equals(TEXT("var"), ESearchCase::IgnoreCase)
+			|| FormName.Equals(TEXT("comment"), ESearchCase::IgnoreCase))
+		{
+			// asset-level declarations / comments are handled separately and should not emit graph nodes here
+			continue;
+		}
 		else
 
 		{
@@ -7436,14 +7830,33 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		return FBlueprintLispResult::Fail(ValidationCtx.Errors.Num() > 0 ? ValidationCtx.Errors[0] : TEXT("ImportGraph aborted due to unsupported DSL forms"));
 	}
 
+	IMP_EnsureBlueprintVariablesFromTopLevelForms(PR.Nodes, ValidationCtx);
+	if (ValidationCtx.Errors.Num() > 0)
+	{
+		return IMP_FailFromContext(ValidationCtx, TEXT("ImportGraph var declaration failed"));
+	}
+
 	if (Options.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
 	{
 		IMP_ClearGraphForReplace(Graph, IMP_DetectGraphKind(Graph));
 	}
 
-	FLispNodePtr TopExpr = PR.Nodes[0];
+	FLispNodePtr TopExpr;
+	for (const FLispNodePtr& Candidate : PR.Nodes)
+	{
+		if (!Candidate.IsValid() || !Candidate->IsList() || Candidate->Num() == 0)
+		{
+			continue;
+		}
+		if (Candidate->GetFormName().Equals(TEXT("var"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		TopExpr = Candidate;
+		break;
+	}
 	if (!TopExpr.IsValid() || !TopExpr->IsList())
-		return FBlueprintLispResult::Fail(TEXT("ImportGraph: top-level expression must be a list"));
+		return FBlueprintLispResult::Fail(TEXT("ImportGraph: no non-var top-level expression found"));
 
 	FString FormName = TopExpr->GetFormName().ToLower();
 	if (FormName == TEXT("function"))
