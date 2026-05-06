@@ -157,9 +157,33 @@ def inspect_variable_state(stage_name):
     return payload
 
 
+def list_variable_state(stage_name):
+    list_result = bridge.list_member_variables(TEST_ASSET)
+    report[f"list_success_{stage_name}"] = get_bool(list_result, "success", "b_success")
+    report[f"list_message_{stage_name}"] = get_text(list_result, "message")
+    report[f"list_warnings_{stage_name}"] = get_list(list_result, "warnings")
+    payload_text = get_text(list_result, "dsl_text")
+    report[f"list_payload_text_{stage_name}"] = payload_text
+    if not report[f"list_success_{stage_name}"]:
+        return None
+    try:
+        payload = json.loads(payload_text or "{}")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"变量列表结果不是合法 JSON ({stage_name}): {exc}")
+    report[f"list_payload_{stage_name}"] = payload
+    for variable_payload in payload.get("variables", []) or []:
+        if str(variable_payload.get("variable_name", "")) == VARIABLE_NAME:
+            report[f"list_variable_payload_{stage_name}"] = variable_payload
+            return variable_payload
+    report[f"list_variable_payload_{stage_name}"] = None
+    return None
+
+
 def capture_variable_state(blueprint, stage_name):
     payload = inspect_variable_state(stage_name)
+    list_payload = list_variable_state(stage_name)
     report[f"variable_found_{stage_name}"] = bool(payload)
+    report[f"variable_list_found_{stage_name}"] = bool(list_payload)
     if not payload:
         return None
 
@@ -170,6 +194,8 @@ def capture_variable_state(blueprint, stage_name):
     report[f"variable_owner_blueprint_path_{stage_name}"] = str(payload.get("owner_blueprint_path", "") or "")
     report[f"declared_on_target_blueprint_{stage_name}"] = bool(payload.get("declared_on_target_blueprint", False))
     report[f"has_expose_on_spawn_{stage_name}"] = bool(payload.get("has_expose_on_spawn", False))
+    report[f"is_instance_editable_{stage_name}"] = bool((list_payload or {}).get("is_instance_editable", False))
+    report[f"list_has_expose_on_spawn_{stage_name}"] = bool((list_payload or {}).get("has_expose_on_spawn", False))
     report[f"generated_default_value_{stage_name}"] = generated_default_value
 
     default_value_number = safe_float(default_value_text)
@@ -193,6 +219,7 @@ def capture_variable_state(blueprint, stage_name):
         "default_value_text": default_value_text,
         "generated_default_value": generated_default_value,
         "payload": payload,
+        "list_payload": list_payload,
     }
 
 
@@ -223,10 +250,14 @@ try:
         raise RuntimeError("变量创建后未找到可检查的成员变量状态")
     if not report["declared_on_target_blueprint_after_create"]:
         raise RuntimeError(f"变量创建后 owner blueprint 不符合预期: {report['inspect_payload_after_create']}")
+    if not report["variable_list_found_after_create"]:
+        raise RuntimeError("变量创建后未在成员变量列表中找到目标变量")
     if not report["default_value_matches_after_create"]:
         raise RuntimeError(f"变量创建后默认值不符合预期: {report['variable_default_value_text_after_create']}")
-    if not report["has_expose_on_spawn_after_create"]:
+    if not report["has_expose_on_spawn_after_create"] or not report["list_has_expose_on_spawn_after_create"]:
         raise RuntimeError(f"变量创建后缺少 ExposeOnSpawn 元数据: {report['inspect_payload_after_create']}")
+    if not report["is_instance_editable_after_create"]:
+        raise RuntimeError(f"变量创建后未标记为 Instance Editable: {report['list_variable_payload_after_create']}")
     if report["generated_default_matches_after_create"] is False:
         raise RuntimeError(f"变量创建后生成类默认值不符合预期: {report['generated_default_value_after_create']}")
 
@@ -257,10 +288,14 @@ try:
         raise RuntimeError("类型冲突失败后变量定义丢失")
     if not report["declared_on_target_blueprint_after_mismatch"]:
         raise RuntimeError(f"类型冲突失败后 owner blueprint 被破坏: {report['inspect_payload_after_mismatch']}")
+    if not report["variable_list_found_after_mismatch"]:
+        raise RuntimeError("类型冲突失败后未在成员变量列表中找到目标变量")
     if not report["default_value_matches_after_mismatch"]:
         raise RuntimeError(f"类型冲突失败后默认值被破坏: {report['variable_default_value_text_after_mismatch']}")
-    if not report["has_expose_on_spawn_after_mismatch"]:
+    if not report["has_expose_on_spawn_after_mismatch"] or not report["list_has_expose_on_spawn_after_mismatch"]:
         raise RuntimeError(f"类型冲突失败后 ExposeOnSpawn 元数据被破坏: {report['inspect_payload_after_mismatch']}")
+    if not report["is_instance_editable_after_mismatch"]:
+        raise RuntimeError(f"类型冲突失败后 Instance Editable 被破坏: {report['list_variable_payload_after_mismatch']}")
     if report["generated_default_matches_after_mismatch"] is False:
         raise RuntimeError(f"类型冲突失败后生成类默认值被破坏: {report['generated_default_value_after_mismatch']}")
 

@@ -134,6 +134,292 @@ namespace BPLispBridge
 		Out.Message = In.bSuccess ? SuccessMsg : (In.Error.IsEmpty() ? TEXT("Operation failed") : In.Error);
 		return Out;
 	}
+
+	static FString EscapeDSLStringLiteral(const FString& Value)
+	{
+		FString Escaped = Value;
+		Escaped.ReplaceInline(TEXT("\\"), TEXT("\\\\"));
+		Escaped.ReplaceInline(TEXT("\""), TEXT("\\\""));
+		Escaped.ReplaceInline(TEXT("\r"), TEXT("\\r"));
+		Escaped.ReplaceInline(TEXT("\n"), TEXT("\\n"));
+		Escaped.ReplaceInline(TEXT("\t"), TEXT("\\t"));
+		return Escaped;
+	}
+
+	static FString TopLevelVarTypeFromCategory(const FName& PinCategory, const FName& PinSubCategory, UObject* PinSubCategoryObject, FString& OutUnsupportedReason)
+	{
+		OutUnsupportedReason.Reset();
+		const FString PinCategoryString = PinCategory.ToString();
+		if (PinCategoryString == TEXT("bool"))
+		{
+			return TEXT("bool");
+		}
+		if (PinCategoryString == TEXT("int"))
+		{
+			return TEXT("int");
+		}
+		if (PinCategoryString == TEXT("int64"))
+		{
+			return TEXT("int64");
+		}
+		if (PinCategoryString == TEXT("byte"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName();
+			}
+			return TEXT("byte");
+		}
+		if (PinCategoryString == TEXT("float"))
+		{
+			return TEXT("float");
+		}
+		if (PinCategoryString == TEXT("real") || PinCategoryString == TEXT("double"))
+		{
+			return PinSubCategory == UEdGraphSchema_K2::PC_Double ? TEXT("double") : TEXT("float");
+		}
+		if (PinCategoryString == TEXT("string"))
+		{
+			return TEXT("string");
+		}
+		if (PinCategoryString == TEXT("name"))
+		{
+			return TEXT("name");
+		}
+		if (PinCategoryString == TEXT("text"))
+		{
+			return TEXT("text");
+		}
+		if (PinCategoryString == TEXT("struct"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName().ToLower();
+			}
+			OutUnsupportedReason = TEXT("struct variable type is missing a concrete struct reference");
+			return FString();
+		}
+		if (PinCategoryString == TEXT("object") || PinCategoryString == TEXT("class"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName();
+			}
+			OutUnsupportedReason = TEXT("object/class variable type is missing a concrete class reference");
+			return FString();
+		}
+		if (PinCategoryString == TEXT("softclass"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return FString::Printf(TEXT("softclass<%s>"), *PinSubCategoryObject->GetName());
+			}
+			OutUnsupportedReason = TEXT("softclass variable type is missing a concrete class reference");
+			return FString();
+		}
+		if (PinCategoryString == TEXT("interface"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return FString::Printf(TEXT("interface<%s>"), *PinSubCategoryObject->GetName());
+			}
+			OutUnsupportedReason = TEXT("interface variable type is missing a concrete interface reference");
+			return FString();
+		}
+
+		OutUnsupportedReason = FString::Printf(TEXT("pin category '%s' is not yet supported by top-level var import"), *PinCategoryString);
+		return FString();
+	}
+
+	static FString TerminalTypeToTopLevelVarType(const FEdGraphTerminalType& TerminalType, FString& OutUnsupportedReason)
+	{
+		return TopLevelVarTypeFromCategory(
+			TerminalType.TerminalCategory,
+			TerminalType.TerminalSubCategory,
+			TerminalType.TerminalSubCategoryObject.Get(),
+			OutUnsupportedReason);
+	}
+
+	static FString PinTypeToTopLevelVarType(const FEdGraphPinType& PinType, FString& OutUnsupportedReason)
+	{
+		OutUnsupportedReason.Reset();
+
+		if (PinType.IsArray())
+		{
+			FString ElementReason;
+			const FString ElementType = TopLevelVarTypeFromCategory(
+				PinType.PinCategory,
+				PinType.PinSubCategory,
+				PinType.PinSubCategoryObject.Get(),
+				ElementReason);
+			if (ElementType.IsEmpty())
+			{
+				OutUnsupportedReason = FString::Printf(TEXT("array element type is unsupported: %s"), *ElementReason);
+				return FString();
+			}
+			return FString::Printf(TEXT("array<%s>"), *ElementType);
+		}
+
+		if (PinType.IsSet())
+		{
+			FString ElementReason;
+			const FString ElementType = TopLevelVarTypeFromCategory(
+				PinType.PinCategory,
+				PinType.PinSubCategory,
+				PinType.PinSubCategoryObject.Get(),
+				ElementReason);
+			if (ElementType.IsEmpty())
+			{
+				OutUnsupportedReason = FString::Printf(TEXT("set element type is unsupported: %s"), *ElementReason);
+				return FString();
+			}
+			return FString::Printf(TEXT("set<%s>"), *ElementType);
+		}
+
+		if (PinType.IsMap())
+		{
+			FString KeyReason;
+			const FString KeyType = TopLevelVarTypeFromCategory(
+				PinType.PinCategory,
+				PinType.PinSubCategory,
+				PinType.PinSubCategoryObject.Get(),
+				KeyReason);
+			if (KeyType.IsEmpty())
+			{
+				OutUnsupportedReason = FString::Printf(TEXT("map key type is unsupported: %s"), *KeyReason);
+				return FString();
+			}
+
+			FString ValueReason;
+			const FString ValueType = TerminalTypeToTopLevelVarType(PinType.PinValueType, ValueReason);
+			if (ValueType.IsEmpty())
+			{
+				OutUnsupportedReason = FString::Printf(TEXT("map value type is unsupported: %s"), *ValueReason);
+				return FString();
+			}
+
+			return FString::Printf(TEXT("map<%s,%s>"), *KeyType, *ValueType);
+		}
+
+		return TopLevelVarTypeFromCategory(
+			PinType.PinCategory,
+			PinType.PinSubCategory,
+			PinType.PinSubCategoryObject.Get(),
+			OutUnsupportedReason);
+	}
+
+	static bool TryBuildTopLevelVarDefaultLiteral(const FEdGraphPinType& PinType, const FString& DefaultValue, FString& OutLiteral, FString& OutUnsupportedReason)
+	{
+		OutLiteral.Reset();
+		OutUnsupportedReason.Reset();
+		const FString TrimmedDefaultValue = DefaultValue.TrimStartAndEnd();
+		if (TrimmedDefaultValue.IsEmpty())
+		{
+			return true;
+		}
+
+		if (PinType.IsArray() || PinType.IsSet() || PinType.IsMap())
+		{
+			OutUnsupportedReason = TEXT("container default literal export is not yet supported by top-level var import");
+			return false;
+		}
+
+		const FString PinCategory = PinType.PinCategory.ToString();
+		if (PinCategory == TEXT("bool"))
+		{
+			if (TrimmedDefaultValue.Equals(TEXT("true"), ESearchCase::IgnoreCase)
+				|| TrimmedDefaultValue.Equals(TEXT("false"), ESearchCase::IgnoreCase))
+			{
+				OutLiteral = TrimmedDefaultValue.ToLower();
+				return true;
+			}
+			OutUnsupportedReason = TEXT("bool default is not a true/false literal");
+			return false;
+		}
+
+		if (PinCategory == TEXT("int")
+			|| PinCategory == TEXT("int64")
+			|| (PinCategory == TEXT("byte") && !PinType.PinSubCategoryObject.IsValid())
+			|| PinCategory == TEXT("float")
+			|| PinCategory == TEXT("real")
+			|| PinCategory == TEXT("double"))
+		{
+			OutLiteral = TrimmedDefaultValue;
+			return true;
+		}
+
+		if (PinCategory == TEXT("byte") && PinType.PinSubCategoryObject.IsValid())
+		{
+			OutLiteral = FString::Printf(TEXT("\"%s\""), *EscapeDSLStringLiteral(DefaultValue));
+			return true;
+		}
+
+		if (PinCategory == TEXT("string") || PinCategory == TEXT("name") || PinCategory == TEXT("text"))
+		{
+			OutLiteral = FString::Printf(TEXT("\"%s\""), *EscapeDSLStringLiteral(DefaultValue));
+			return true;
+		}
+
+		OutUnsupportedReason = FString::Printf(TEXT("default literal export is not yet supported for pin category '%s'"), *PinCategory);
+		return false;
+	}
+
+	static TSharedRef<FJsonObject> MakeMemberVariablePayload(UBlueprint* Blueprint, const FBPVariableDescription& VariableDesc)
+	{
+		const FName VariableName = VariableDesc.VarName;
+		const FEdGraphPinType& PinType = VariableDesc.VarType;
+
+		FString TypeUnsupportedReason;
+		const FString DSLType = PinTypeToTopLevelVarType(PinType, TypeUnsupportedReason);
+		const bool bTopLevelVarSupported = !DSLType.IsEmpty();
+
+		FString DefaultLiteral;
+		FString DefaultLiteralUnsupportedReason;
+		const bool bDefaultLiteralSupported = TryBuildTopLevelVarDefaultLiteral(PinType, VariableDesc.DefaultValue, DefaultLiteral, DefaultLiteralUnsupportedReason);
+
+		FString ExposeOnSpawnValue;
+		const bool bHasExposeOnSpawn = FBlueprintEditorUtils::GetBlueprintVariableMetaData(
+			Blueprint,
+			VariableName,
+			nullptr,
+			FBlueprintMetadata::MD_ExposeOnSpawn,
+			ExposeOnSpawnValue) && ExposeOnSpawnValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
+
+		TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+		Payload->SetStringField(TEXT("variable_name"), VariableName.ToString());
+		Payload->SetStringField(TEXT("pin_category"), PinType.PinCategory.ToString());
+		Payload->SetStringField(TEXT("pin_sub_category"), PinType.PinSubCategory.ToString());
+		Payload->SetStringField(TEXT("default_value"), VariableDesc.DefaultValue);
+		Payload->SetBoolField(TEXT("has_expose_on_spawn"), bHasExposeOnSpawn);
+		Payload->SetBoolField(TEXT("is_instance_editable"), (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0);
+		Payload->SetBoolField(TEXT("is_array"), PinType.IsArray());
+		Payload->SetBoolField(TEXT("is_set"), PinType.IsSet());
+		Payload->SetBoolField(TEXT("is_map"), PinType.IsMap());
+		Payload->SetBoolField(TEXT("top_level_var_supported"), bTopLevelVarSupported);
+		Payload->SetBoolField(TEXT("default_literal_supported"), bDefaultLiteralSupported);
+		Payload->SetBoolField(TEXT("exact_recreation_supported"), bTopLevelVarSupported && bDefaultLiteralSupported);
+		if (!DSLType.IsEmpty())
+		{
+			Payload->SetStringField(TEXT("dsl_type"), DSLType);
+		}
+		if (PinType.PinSubCategoryObject.IsValid())
+		{
+			Payload->SetStringField(TEXT("sub_category_object"), PinType.PinSubCategoryObject->GetPathName());
+		}
+		if (!TypeUnsupportedReason.IsEmpty())
+		{
+			Payload->SetStringField(TEXT("type_unsupported_reason"), TypeUnsupportedReason);
+		}
+		if (!DefaultLiteral.IsEmpty())
+		{
+			Payload->SetStringField(TEXT("dsl_default_literal"), DefaultLiteral);
+		}
+		if (!DefaultLiteralUnsupportedReason.IsEmpty())
+		{
+			Payload->SetStringField(TEXT("default_literal_unsupported_reason"), DefaultLiteralUnsupportedReason);
+		}
+		return Payload;
+	}
 }
 
 // ========== Export ==========
@@ -461,6 +747,40 @@ FBlueprintLispPythonResult UBlueprintLispPythonBridge::InspectMemberVariable(con
 	Result.AssetPath = ResolvedPath;
 	Result.DSLText = PayloadText;
 	Result.Message = FString::Printf(TEXT("Inspected variable '%s' in %s"), *TrimmedVariableName, *ResolvedPath);
+	return Result;
+}
+
+FBlueprintLispPythonResult UBlueprintLispPythonBridge::ListMemberVariables(const FString& BlueprintPath)
+{
+	FString ResolvedPath;
+	FString Error;
+	UBlueprint* BP = BPLispBridge::LoadBlueprintByPath(BlueprintPath, ResolvedPath, Error);
+	if (!BP)
+	{
+		return BPLispBridge::MakeFailure(Error);
+	}
+
+	TArray<TSharedPtr<FJsonValue>> VariablePayloads;
+	VariablePayloads.Reserve(BP->NewVariables.Num());
+	for (const FBPVariableDescription& VariableDesc : BP->NewVariables)
+	{
+		VariablePayloads.Add(MakeShared<FJsonValueObject>(BPLispBridge::MakeMemberVariablePayload(BP, VariableDesc)));
+	}
+
+	TSharedRef<FJsonObject> Payload = MakeShared<FJsonObject>();
+	Payload->SetStringField(TEXT("blueprint_path"), ResolvedPath);
+	Payload->SetNumberField(TEXT("variable_count"), BP->NewVariables.Num());
+	Payload->SetArrayField(TEXT("variables"), VariablePayloads);
+
+	FString PayloadText;
+	TSharedRef<TJsonWriter<>> JsonWriter = TJsonWriterFactory<>::Create(&PayloadText);
+	FJsonSerializer::Serialize(Payload, JsonWriter);
+
+	FBlueprintLispPythonResult Result;
+	Result.bSuccess = true;
+	Result.AssetPath = ResolvedPath;
+	Result.DSLText = PayloadText;
+	Result.Message = FString::Printf(TEXT("Listed %d member variables in %s"), BP->NewVariables.Num(), *ResolvedPath);
 	return Result;
 }
 

@@ -204,6 +204,14 @@ public:
 		const FString& BlueprintPath,
 		const FString& VariableName);
 
+	/**
+	 * List Blueprint-declared member variables and return a JSON array payload in DSLText.
+	 * Each entry includes the variable name, type metadata, default value, and whether
+	 * the current top-level var importer can recreate the declaration exactly.
+	 */
+	UFUNCTION(BlueprintCallable, Category="BlueprintLisp|Python")
+	static FBlueprintLispPythonResult ListMemberVariables(const FString& BlueprintPath);
+
 	// ---------------------------------------------------------------
 	// Validation
 	// ---------------------------------------------------------------

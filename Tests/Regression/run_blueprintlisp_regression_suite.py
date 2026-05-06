@@ -95,6 +95,9 @@ def main():
         extra_args = case.get("extra_args", [])
         if not isinstance(extra_args, list):
             raise RuntimeError(f"case.extra_args 必须是数组: {case_id}")
+        forbidden_log_substrings = case.get("forbidden_log_substrings", [])
+        if not isinstance(forbidden_log_substrings, list):
+            raise RuntimeError(f"case.forbidden_log_substrings 必须是数组: {case_id}")
 
         case_editor_cmd = case.get("editor_cmd") or default_editor_cmd
         case_uproject = case.get("uproject") or default_uproject
@@ -130,6 +133,7 @@ def main():
             "editor_cmd": case_editor_cmd,
             "uproject": case_uproject,
             "command": command,
+            "forbidden_log_substrings": forbidden_log_substrings,
         }
 
 
@@ -148,12 +152,19 @@ def main():
                 f.write(combined_output)
             case_report["command_exit_code"] = completed.returncode
             case_report["command_timed_out"] = False
+            case_report["forbidden_log_hits"] = [
+                substring for substring in forbidden_log_substrings
+                if substring and substring in combined_output
+            ]
+            case_report["log_guards_passed"] = not case_report["forbidden_log_hits"]
         except subprocess.TimeoutExpired as exc:
             combined_output = (exc.stdout or "") + ("\n" if exc.stdout and exc.stderr else "") + (exc.stderr or "")
             with open(log_path, "w", encoding="utf-8") as f:
                 f.write(combined_output)
             case_report["command_exit_code"] = None
             case_report["command_timed_out"] = True
+            case_report["forbidden_log_hits"] = []
+            case_report["log_guards_passed"] = True
             case_report["result_read_error"] = f"命令超时: {timeout_seconds}s"
             case_report["actual_success"] = None
             case_report["status"], case_report["matched_expectation"] = build_status(expected_success, None)
@@ -171,6 +182,14 @@ def main():
 
         case_report["actual_success"] = actual_success
         case_report["status"], case_report["matched_expectation"] = build_status(expected_success, actual_success)
+        if not case_report.get("log_guards_passed", True):
+            case_report["status"] = "fail"
+            case_report["matched_expectation"] = False
+            case_report["result_read_error"] = (
+                f"日志命中禁用片段: {case_report['forbidden_log_hits']}"
+                if not case_report.get("result_read_error")
+                else case_report["result_read_error"]
+            )
         overall_success = overall_success and case_report["matched_expectation"]
         suite_report["cases"].append(case_report)
 

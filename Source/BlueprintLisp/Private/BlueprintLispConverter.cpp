@@ -176,27 +176,77 @@ static UEdGraphPin* GetThenPin(UEdGraphNode* Node)
 /** Map EdGraphPinType to a Lisp type symbol */
 static FString PinTypeToLispType(const FEdGraphPinType& PT)
 {
-	FString Cat = PT.PinCategory.ToString();
-	if (Cat == TEXT("bool"))   return TEXT("bool");
-	if (Cat == TEXT("int"))    return TEXT("int");
-	if (Cat == TEXT("int64"))  return TEXT("int64");
-	if (Cat == TEXT("float") || Cat == TEXT("real") || Cat == TEXT("double")) return TEXT("float");
-	if (Cat == TEXT("string")) return TEXT("string");
-	if (Cat == TEXT("name"))   return TEXT("name");
-	if (Cat == TEXT("text"))   return TEXT("text");
-	if (Cat == TEXT("struct"))
+	auto BaseTypeToLisp = [](const FName& PinCategory, const FName& PinSubCategory, UObject* PinSubCategoryObject) -> FString
 	{
-		if (PT.PinSubCategoryObject.IsValid())
-			return PT.PinSubCategoryObject->GetName().ToLower();
-		return TEXT("struct");
-	}
-	if (Cat == TEXT("object") || Cat == TEXT("class"))
+		const FString Cat = PinCategory.ToString();
+		if (Cat == TEXT("bool"))   return TEXT("bool");
+		if (Cat == TEXT("int"))    return TEXT("int");
+		if (Cat == TEXT("int64"))  return TEXT("int64");
+		if (Cat == TEXT("float"))  return TEXT("float");
+		if (Cat == TEXT("real") || Cat == TEXT("double")) return PinSubCategory == UEdGraphSchema_K2::PC_Double ? TEXT("double") : TEXT("float");
+		if (Cat == TEXT("string")) return TEXT("string");
+		if (Cat == TEXT("name"))   return TEXT("name");
+		if (Cat == TEXT("text"))   return TEXT("text");
+		if (Cat == TEXT("byte"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName();
+			}
+			return TEXT("byte");
+		}
+		if (Cat == TEXT("struct"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName().ToLower();
+			}
+			return TEXT("struct");
+		}
+		if (Cat == TEXT("object") || Cat == TEXT("class"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return PinSubCategoryObject->GetName();
+			}
+			return TEXT("object");
+		}
+		if (Cat == TEXT("softclass"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return FString::Printf(TEXT("softclass<%s>"), *PinSubCategoryObject->GetName());
+			}
+			return TEXT("softclass");
+		}
+		if (Cat == TEXT("interface"))
+		{
+			if (PinSubCategoryObject)
+			{
+				return FString::Printf(TEXT("interface<%s>"), *PinSubCategoryObject->GetName());
+			}
+			return TEXT("interface");
+		}
+		return Cat.ToLower();
+	};
+
+	if (PT.IsArray())
 	{
-		if (PT.PinSubCategoryObject.IsValid())
-			return PT.PinSubCategoryObject->GetName();
-		return TEXT("object");
+		return FString::Printf(TEXT("array<%s>"), *BaseTypeToLisp(PT.PinCategory, PT.PinSubCategory, PT.PinSubCategoryObject.Get()));
 	}
-	return Cat.ToLower();
+	if (PT.IsSet())
+	{
+		return FString::Printf(TEXT("set<%s>"), *BaseTypeToLisp(PT.PinCategory, PT.PinSubCategory, PT.PinSubCategoryObject.Get()));
+	}
+	if (PT.IsMap())
+	{
+		return FString::Printf(
+			TEXT("map<%s,%s>"),
+			*BaseTypeToLisp(PT.PinCategory, PT.PinSubCategory, PT.PinSubCategoryObject.Get()),
+			*BaseTypeToLisp(PT.PinValueType.TerminalCategory, PT.PinValueType.TerminalSubCategory, PT.PinValueType.TerminalSubCategoryObject.Get()));
+	}
+
+	return BaseTypeToLisp(PT.PinCategory, PT.PinSubCategory, PT.PinSubCategoryObject.Get());
 }
 
 static bool EXP_IsEntryValueSource(UEdGraphNode* SourceNode)
@@ -4675,7 +4725,163 @@ static bool IMP_TryExtractNamedTypedPair(const FLispNodePtr& PairNode, FString& 
 	return !OutName.IsEmpty() && !OutType.IsEmpty();
 }
 
-static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinType& OutPinType, FBPImportContext& Ctx)
+static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinType& OutPinType, FBPImportContext& Ctx);
+
+static bool IMP_LooksLikeContainerTypeGrammar(const FString& TypeName)
+{
+	const FString Normalized = TypeName.TrimStartAndEnd();
+	int32 GenericStartIndex = INDEX_NONE;
+	if (!Normalized.FindChar('<', GenericStartIndex) || GenericStartIndex <= 0)
+	{
+		return false;
+	}
+
+	const FString Prefix = Normalized.Left(GenericStartIndex).TrimStartAndEnd().ToLower();
+	return Prefix == TEXT("array") || Prefix == TEXT("set") || Prefix == TEXT("map");
+}
+
+static bool IMP_TrySplitTopLevelTypeArguments(const FString& Source, TArray<FString>& OutArgs)
+{
+	OutArgs.Reset();
+
+	int32 Depth = 0;
+	FString Current;
+	for (const TCHAR Char : Source)
+	{
+		if (Char == '<')
+		{
+			Depth += 1;
+			Current.AppendChar(Char);
+			continue;
+		}
+		if (Char == '>')
+		{
+			if (Depth <= 0)
+			{
+				return false;
+			}
+			Depth -= 1;
+			Current.AppendChar(Char);
+			continue;
+		}
+		if (Char == ',' && Depth == 0)
+		{
+			const FString TrimmedArg = Current.TrimStartAndEnd();
+			if (TrimmedArg.IsEmpty())
+			{
+				return false;
+			}
+			OutArgs.Add(TrimmedArg);
+			Current.Reset();
+			continue;
+		}
+		Current.AppendChar(Char);
+	}
+
+	if (Depth != 0)
+	{
+		return false;
+	}
+
+	const FString TrimmedArg = Current.TrimStartAndEnd();
+	if (TrimmedArg.IsEmpty())
+	{
+		return false;
+	}
+	OutArgs.Add(TrimmedArg);
+	return true;
+}
+
+static bool IMP_TryParseContainerTypeGrammar(const FString& TypeName, FString& OutContainerKind, TArray<FString>& OutTypeArgs)
+{
+	OutContainerKind.Reset();
+	OutTypeArgs.Reset();
+
+	const FString Normalized = TypeName.TrimStartAndEnd();
+	int32 GenericStartIndex = INDEX_NONE;
+	if (!Normalized.FindChar('<', GenericStartIndex) || GenericStartIndex <= 0 || !Normalized.EndsWith(TEXT(">")))
+	{
+		return false;
+	}
+
+	OutContainerKind = Normalized.Left(GenericStartIndex).TrimStartAndEnd().ToLower();
+	if (OutContainerKind != TEXT("array") && OutContainerKind != TEXT("set") && OutContainerKind != TEXT("map"))
+	{
+		OutContainerKind.Reset();
+		return false;
+	}
+
+	const FString InnerArgs = Normalized.Mid(GenericStartIndex + 1, Normalized.Len() - GenericStartIndex - 2).TrimStartAndEnd();
+	if (InnerArgs.IsEmpty() || !IMP_TrySplitTopLevelTypeArguments(InnerArgs, OutTypeArgs))
+	{
+		OutContainerKind.Reset();
+		OutTypeArgs.Reset();
+		return false;
+	}
+
+	const int32 ExpectedArgCount = OutContainerKind == TEXT("map") ? 2 : 1;
+	if (OutTypeArgs.Num() != ExpectedArgCount)
+	{
+		OutContainerKind.Reset();
+		OutTypeArgs.Reset();
+		return false;
+	}
+
+	return true;
+}
+
+static bool IMP_TryParseWrappedReferenceTypeGrammar(const FString& TypeName, FString& OutWrapperKind, FString& OutInnerType)
+{
+	OutWrapperKind.Reset();
+	OutInnerType.Reset();
+
+	const FString Normalized = TypeName.TrimStartAndEnd();
+	int32 GenericStartIndex = INDEX_NONE;
+	if (!Normalized.FindChar('<', GenericStartIndex) || GenericStartIndex <= 0 || !Normalized.EndsWith(TEXT(">")))
+	{
+		return false;
+	}
+
+	OutWrapperKind = Normalized.Left(GenericStartIndex).TrimStartAndEnd().ToLower();
+	if (OutWrapperKind != TEXT("softclass") && OutWrapperKind != TEXT("interface"))
+	{
+		OutWrapperKind.Reset();
+		return false;
+	}
+
+	const FString InnerArgs = Normalized.Mid(GenericStartIndex + 1, Normalized.Len() - GenericStartIndex - 2).TrimStartAndEnd();
+	TArray<FString> ParsedArgs;
+	if (InnerArgs.IsEmpty() || !IMP_TrySplitTopLevelTypeArguments(InnerArgs, ParsedArgs) || ParsedArgs.Num() != 1)
+	{
+		OutWrapperKind.Reset();
+		return false;
+	}
+
+	OutInnerType = ParsedArgs[0];
+	return true;
+}
+
+static bool IMP_BuildTerminalTypeFromLispType(const FString& TypeName, FEdGraphTerminalType& OutTerminalType, FBPImportContext& Ctx)
+{
+	FEdGraphPinType ValuePinType;
+	if (!IMP_BuildPinTypeFromLispType(TypeName, ValuePinType, Ctx))
+	{
+		return false;
+	}
+	if (ValuePinType.IsArray() || ValuePinType.IsSet() || ValuePinType.IsMap())
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: nested container type '%s' is not supported"), *TypeName));
+		return false;
+	}
+
+	OutTerminalType = FEdGraphTerminalType();
+	OutTerminalType.TerminalCategory = ValuePinType.PinCategory;
+	OutTerminalType.TerminalSubCategory = ValuePinType.PinSubCategory;
+	OutTerminalType.TerminalSubCategoryObject = ValuePinType.PinSubCategoryObject.Get();
+	return true;
+}
+
+static bool IMP_BuildNonContainerPinTypeFromLispType(const FString& TypeName, FEdGraphPinType& OutPinType, FBPImportContext& Ctx)
 {
 	OutPinType = FEdGraphPinType();
 
@@ -4737,6 +4943,42 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 		return true;
 	}
 
+	FString WrapperKind;
+	FString WrappedInnerType;
+	if (IMP_TryParseWrappedReferenceTypeGrammar(Normalized, WrapperKind, WrappedInnerType))
+	{
+		UClass* ResolvedWrappedClass = IMP_FindClassByName(WrappedInnerType, Ctx);
+		if (!ResolvedWrappedClass)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: could not resolve %s type '%s'"), *WrapperKind, *WrappedInnerType));
+			return false;
+		}
+
+		if (WrapperKind == TEXT("softclass"))
+		{
+			OutPinType.PinCategory = UEdGraphSchema_K2::PC_SoftClass;
+			OutPinType.PinSubCategoryObject = ResolvedWrappedClass;
+			return true;
+		}
+
+		if (!ResolvedWrappedClass->HasAnyClassFlags(CLASS_Interface))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: type '%s' is not an interface class"), *WrappedInnerType));
+			return false;
+		}
+
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Interface;
+		OutPinType.PinSubCategoryObject = ResolvedWrappedClass;
+		return true;
+	}
+
+	if (UEnum* ResolvedEnum = IMP_FindEnumByName(Normalized))
+	{
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Byte;
+		OutPinType.PinSubCategoryObject = ResolvedEnum;
+		return true;
+	}
+
 	if (UClass* ResolvedClass = IMP_FindClassByName(Normalized, Ctx))
 	{
 		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Object;
@@ -4745,6 +4987,54 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 	}
 
 	return false;
+}
+
+static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinType& OutPinType, FBPImportContext& Ctx)
+{
+	OutPinType = FEdGraphPinType();
+
+	if (IMP_LooksLikeContainerTypeGrammar(TypeName))
+	{
+		FString ContainerKind;
+		TArray<FString> TypeArgs;
+		if (!IMP_TryParseContainerTypeGrammar(TypeName, ContainerKind, TypeArgs))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: malformed container type '%s'"), *TypeName));
+			return false;
+		}
+
+		if (!IMP_BuildNonContainerPinTypeFromLispType(TypeArgs[0], OutPinType, Ctx))
+		{
+			return false;
+		}
+		if (OutPinType.IsArray() || OutPinType.IsSet() || OutPinType.IsMap())
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: nested container type '%s' is not supported"), *TypeName));
+			return false;
+		}
+
+		if (ContainerKind == TEXT("array"))
+		{
+			OutPinType.ContainerType = EPinContainerType::Array;
+			return true;
+		}
+		if (ContainerKind == TEXT("set"))
+		{
+			OutPinType.ContainerType = EPinContainerType::Set;
+			return true;
+		}
+
+		FEdGraphTerminalType ValueTerminalType;
+		if (!IMP_BuildTerminalTypeFromLispType(TypeArgs[1], ValueTerminalType, Ctx))
+		{
+			return false;
+		}
+		OutPinType.ContainerType = EPinContainerType::Map;
+		OutPinType.PinValueType = ValueTerminalType;
+		return true;
+	}
+
+	return IMP_BuildNonContainerPinTypeFromLispType(TypeName, OutPinType, Ctx);
 }
 
 static bool IMP_ArePinTypesEquivalent(const FEdGraphPinType& A, const FEdGraphPinType& B)
@@ -5019,6 +5309,7 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 	}
 
 	bool bModified = false;
+	bool bStructurallyModified = false;
 	FBPVariableDescription& VariableDesc = Ctx.Blueprint->NewVariables[VarIndex];
 	if (Spec.bHasDefaultValue && VariableDesc.DefaultValue != Spec.DefaultValue)
 	{
@@ -5037,6 +5328,17 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 			FBlueprintMetadata::MD_ExposeOnSpawn,
 			ExistingExposeOnSpawnValue);
 		const bool bCurrentlyExposeOnSpawn = bHadExposeOnSpawnMeta && ExistingExposeOnSpawnValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
+		const bool bCurrentlyInstanceEditable = (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0;
+		if (Spec.bExposeOnSpawn && !bCurrentlyInstanceEditable)
+		{
+			Ctx.Blueprint->Modify();
+			VariableDesc.PropertyFlags &= ~CPF_DisableEditOnInstance;
+			VariableDesc.PropertyFlags |= (CPF_Edit | CPF_BlueprintVisible);
+			FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, FName(*Spec.VarName), false);
+			bModified = true;
+			bStructurallyModified = true;
+		}
+
 		if (Spec.bExposeOnSpawn != bCurrentlyExposeOnSpawn || (!Spec.bExposeOnSpawn && bHadExposeOnSpawnMeta))
 		{
 			if (Spec.bExposeOnSpawn)
@@ -5051,7 +5353,11 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 		}
 	}
 
-	if (bModified)
+	if (bStructurallyModified)
+	{
+		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Ctx.Blueprint);
+	}
+	else if (bModified)
 	{
 		FBlueprintEditorUtils::MarkBlueprintAsModified(Ctx.Blueprint);
 	}
