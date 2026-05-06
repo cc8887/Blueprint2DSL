@@ -1597,6 +1597,8 @@ struct FIMPBlueprintVariableImportSpec
 	FString DefaultValue;
 	bool bHasExposeOnSpawn = false;
 	bool bExposeOnSpawn = false;
+	bool bHasInstanceEditable = false;
+	bool bInstanceEditable = false;
 };
 
 static bool IMP_TryParseBoolLiteral(const FLispNodePtr& Node, bool& OutValue);
@@ -5278,8 +5280,29 @@ static bool IMP_TryParseBlueprintVariableImportSpec(const FLispNodePtr& Form, FI
 			OutSpec.bHasExposeOnSpawn = true;
 			continue;
 		}
+		if (Keyword.Equals(TEXT(":instance-editable"), ESearchCase::IgnoreCase))
+		{
+			if (OutSpec.bHasInstanceEditable)
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: duplicate :instance-editable for '%s'"), *OutSpec.VarName));
+				return false;
+			}
+			if (!IMP_TryParseBoolLiteral(ValueNode, OutSpec.bInstanceEditable))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: :instance-editable for '%s' must be true/false"), *OutSpec.VarName));
+				return false;
+			}
+			OutSpec.bHasInstanceEditable = true;
+			continue;
+		}
 
 		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: unsupported option '%s' for '%s'"), *Keyword, *OutSpec.VarName));
+		return false;
+	}
+
+	if (OutSpec.bHasExposeOnSpawn && OutSpec.bHasInstanceEditable && OutSpec.bExposeOnSpawn && !OutSpec.bInstanceEditable)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: '%s' cannot set :expose-on-spawn true together with :instance-editable false"), *OutSpec.VarName));
 		return false;
 	}
 
@@ -5295,7 +5318,7 @@ static bool IMP_TryFindOwnedBlueprintVariable(UBlueprint* Blueprint, const FName
 
 static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImportSpec& Spec, FBPImportContext& Ctx)
 {
-	if (!Ctx.Blueprint || (!Spec.bHasDefaultValue && !Spec.bHasExposeOnSpawn))
+	if (!Ctx.Blueprint || (!Spec.bHasDefaultValue && !Spec.bHasExposeOnSpawn && !Spec.bHasInstanceEditable))
 	{
 		return true;
 	}
@@ -5310,6 +5333,7 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 
 	bool bModified = false;
 	bool bStructurallyModified = false;
+	const FName VariableFName(*Spec.VarName);
 	FBPVariableDescription& VariableDesc = Ctx.Blueprint->NewVariables[VarIndex];
 	if (Spec.bHasDefaultValue && VariableDesc.DefaultValue != Spec.DefaultValue)
 	{
@@ -5318,36 +5342,63 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 		bModified = true;
 	}
 
+	bool bCurrentInstanceEditable = (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0;
+	if (Spec.bHasInstanceEditable && Spec.bInstanceEditable != bCurrentInstanceEditable)
+	{
+		Ctx.Blueprint->Modify();
+		if (Spec.bInstanceEditable)
+		{
+			VariableDesc.PropertyFlags &= ~CPF_DisableEditOnInstance;
+			VariableDesc.PropertyFlags |= (CPF_Edit | CPF_BlueprintVisible);
+			FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, VariableFName, false);
+		}
+		else
+		{
+			FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, VariableFName, true);
+		}
+		bModified = true;
+		bStructurallyModified = true;
+		bCurrentInstanceEditable = (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0;
+	}
+
 	if (Spec.bHasExposeOnSpawn)
 	{
 		FString ExistingExposeOnSpawnValue;
 		const bool bHadExposeOnSpawnMeta = FBlueprintEditorUtils::GetBlueprintVariableMetaData(
 			Ctx.Blueprint,
-			FName(*Spec.VarName),
+			VariableFName,
 			nullptr,
 			FBlueprintMetadata::MD_ExposeOnSpawn,
 			ExistingExposeOnSpawnValue);
 		const bool bCurrentlyExposeOnSpawn = bHadExposeOnSpawnMeta && ExistingExposeOnSpawnValue.Equals(TEXT("true"), ESearchCase::IgnoreCase);
-		const bool bCurrentlyInstanceEditable = (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0;
-		if (Spec.bExposeOnSpawn && !bCurrentlyInstanceEditable)
+		const bool bTargetInstanceEditable = Spec.bHasInstanceEditable ? Spec.bInstanceEditable : (Spec.bExposeOnSpawn || bCurrentInstanceEditable);
+		if (bTargetInstanceEditable != bCurrentInstanceEditable)
 		{
 			Ctx.Blueprint->Modify();
-			VariableDesc.PropertyFlags &= ~CPF_DisableEditOnInstance;
-			VariableDesc.PropertyFlags |= (CPF_Edit | CPF_BlueprintVisible);
-			FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, FName(*Spec.VarName), false);
+			if (bTargetInstanceEditable)
+			{
+				VariableDesc.PropertyFlags &= ~CPF_DisableEditOnInstance;
+				VariableDesc.PropertyFlags |= (CPF_Edit | CPF_BlueprintVisible);
+				FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, VariableFName, false);
+			}
+			else
+			{
+				FBlueprintEditorUtils::SetBlueprintOnlyEditableFlag(Ctx.Blueprint, VariableFName, true);
+			}
 			bModified = true;
 			bStructurallyModified = true;
+			bCurrentInstanceEditable = (VariableDesc.PropertyFlags & CPF_DisableEditOnInstance) == 0;
 		}
 
 		if (Spec.bExposeOnSpawn != bCurrentlyExposeOnSpawn || (!Spec.bExposeOnSpawn && bHadExposeOnSpawnMeta))
 		{
 			if (Spec.bExposeOnSpawn)
 			{
-				FBlueprintEditorUtils::SetBlueprintVariableMetaData(Ctx.Blueprint, FName(*Spec.VarName), nullptr, FBlueprintMetadata::MD_ExposeOnSpawn, TEXT("true"));
+				FBlueprintEditorUtils::SetBlueprintVariableMetaData(Ctx.Blueprint, VariableFName, nullptr, FBlueprintMetadata::MD_ExposeOnSpawn, TEXT("true"));
 			}
 			else
 			{
-				FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(Ctx.Blueprint, FName(*Spec.VarName), nullptr, FBlueprintMetadata::MD_ExposeOnSpawn);
+				FBlueprintEditorUtils::RemoveBlueprintVariableMetaData(Ctx.Blueprint, VariableFName, nullptr, FBlueprintMetadata::MD_ExposeOnSpawn);
 			}
 			bModified = true;
 		}

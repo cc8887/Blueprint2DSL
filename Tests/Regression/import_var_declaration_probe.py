@@ -13,6 +13,9 @@ GRAPH_NAME = "EventGraph"
 VARIABLE_NAME = "AutoCreatedHealth"
 DEFAULT_VALUE = 42.0
 SET_VALUE = 99
+EDITABLE_ONLY_VARIABLE_NAME = "EditableOnlySpeed"
+EDITABLE_ONLY_DEFAULT_VALUE = 12.0
+EDITABLE_ONLY_SET_VALUE = 17
 
 bridge = unreal.BlueprintLispPythonBridge
 asset_lib = unreal.EditorAssetLibrary
@@ -22,15 +25,18 @@ report = {
     "test_asset": TEST_ASSET,
     "graph_name": GRAPH_NAME,
     "variable_name": VARIABLE_NAME,
+    "editable_only_variable_name": EDITABLE_ONLY_VARIABLE_NAME,
     "errors": [],
 }
 
 
 def build_create_dsl():
-    return rf'''(var {VARIABLE_NAME} float :default {DEFAULT_VALUE:g} :expose-on-spawn true)
+    return rf'''(var {VARIABLE_NAME} float :default {DEFAULT_VALUE:g} :instance-editable true :expose-on-spawn true)
+(var {EDITABLE_ONLY_VARIABLE_NAME} float :default {EDITABLE_ONLY_DEFAULT_VALUE:g} :instance-editable true)
 (event
   ReceiveBeginPlay
-  (set {VARIABLE_NAME} {SET_VALUE}))'''
+  (set {VARIABLE_NAME} {SET_VALUE})
+  (set {EDITABLE_ONLY_VARIABLE_NAME} {EDITABLE_ONLY_SET_VALUE}))'''
 
 
 def build_mismatch_dsl():
@@ -223,6 +229,30 @@ def capture_variable_state(blueprint, stage_name):
     }
 
 
+def capture_editable_only_variable_state(blueprint, stage_name):
+    list_payload = report.get(f"list_payload_{stage_name}") or {}
+    variable_payload = None
+    for item in list_payload.get("variables", []) or []:
+        if str(item.get("variable_name", "")) == EDITABLE_ONLY_VARIABLE_NAME:
+            variable_payload = item
+            break
+
+    report[f"editable_only_variable_found_{stage_name}"] = bool(variable_payload)
+    report[f"editable_only_payload_{stage_name}"] = variable_payload
+
+    generated_default_value = try_get_generated_default_value(blueprint, EDITABLE_ONLY_VARIABLE_NAME)
+    report[f"editable_only_generated_default_value_{stage_name}"] = generated_default_value
+    generated_default_number = safe_float(generated_default_value)
+    report[f"editable_only_generated_default_matches_{stage_name}"] = (
+        generated_default_number is not None
+        and abs(generated_default_number - EDITABLE_ONLY_DEFAULT_VALUE) < 1e-6
+    )
+    report[f"editable_only_is_instance_editable_{stage_name}"] = bool((variable_payload or {}).get("is_instance_editable", False))
+    report[f"editable_only_has_expose_on_spawn_{stage_name}"] = bool((variable_payload or {}).get("has_expose_on_spawn", False))
+
+    return variable_payload
+
+
 try:
     recreate_character_bp(TEST_ASSET)
 
@@ -239,9 +269,10 @@ try:
     report["export_after_create_success"] = get_bool(export_after_create, "success", "b_success")
     report["contains_variable_name_after_create"] = VARIABLE_NAME in export_after_create_dsl
     report["contains_numeric_assignment_after_create"] = contains_set_literal(export_after_create_dsl, VARIABLE_NAME, str(SET_VALUE))
+    report["contains_editable_only_numeric_assignment_after_create"] = contains_set_literal(export_after_create_dsl, EDITABLE_ONLY_VARIABLE_NAME, str(EDITABLE_ONLY_SET_VALUE))
     if not report["export_after_create_success"]:
         raise RuntimeError("变量创建后导出失败")
-    if not report["contains_numeric_assignment_after_create"]:
+    if not report["contains_numeric_assignment_after_create"] or not report["contains_editable_only_numeric_assignment_after_create"]:
         raise RuntimeError("变量创建后导出结果未保留数值赋值")
 
     blueprint_after_create = load_blueprint_asset()
@@ -261,6 +292,16 @@ try:
     if report["generated_default_matches_after_create"] is False:
         raise RuntimeError(f"变量创建后生成类默认值不符合预期: {report['generated_default_value_after_create']}")
 
+    editable_only_state_after_create = capture_editable_only_variable_state(blueprint_after_create, "after_create")
+    if not editable_only_state_after_create:
+        raise RuntimeError("变量创建后未找到 editable-only 成员变量")
+    if not report["editable_only_is_instance_editable_after_create"]:
+        raise RuntimeError(f"editable-only 变量创建后未标记为 Instance Editable: {report['editable_only_payload_after_create']}")
+    if report["editable_only_has_expose_on_spawn_after_create"]:
+        raise RuntimeError(f"editable-only 变量不应带 ExposeOnSpawn: {report['editable_only_payload_after_create']}")
+    if not report["editable_only_generated_default_matches_after_create"]:
+        raise RuntimeError(f"editable-only 变量创建后默认值不符合预期: {report['editable_only_generated_default_value_after_create']}")
+
     mismatch_result = import_graph(build_mismatch_dsl())
     report["mismatch_success"] = get_bool(mismatch_result, "success", "b_success")
     report["mismatch_message"] = get_text(mismatch_result, "message")
@@ -277,9 +318,10 @@ try:
     report["export_after_mismatch_success"] = get_bool(export_after_mismatch, "success", "b_success")
     report["still_contains_numeric_assignment"] = contains_set_literal(export_after_mismatch_dsl, VARIABLE_NAME, str(SET_VALUE))
     report["contains_bool_assignment"] = contains_set_literal(export_after_mismatch_dsl, VARIABLE_NAME, "true")
+    report["still_contains_editable_only_numeric_assignment"] = contains_set_literal(export_after_mismatch_dsl, EDITABLE_ONLY_VARIABLE_NAME, str(EDITABLE_ONLY_SET_VALUE))
     if not report["export_after_mismatch_success"]:
         raise RuntimeError("类型冲突失败后重新导出失败")
-    if not report["still_contains_numeric_assignment"] or report["contains_bool_assignment"]:
+    if not report["still_contains_numeric_assignment"] or report["contains_bool_assignment"] or not report["still_contains_editable_only_numeric_assignment"]:
         raise RuntimeError("类型冲突失败后图内容未保持创建成功后的状态")
 
     blueprint_after_mismatch = load_blueprint_asset()
@@ -298,6 +340,16 @@ try:
         raise RuntimeError(f"类型冲突失败后 Instance Editable 被破坏: {report['list_variable_payload_after_mismatch']}")
     if report["generated_default_matches_after_mismatch"] is False:
         raise RuntimeError(f"类型冲突失败后生成类默认值被破坏: {report['generated_default_value_after_mismatch']}")
+
+    editable_only_state_after_mismatch = capture_editable_only_variable_state(blueprint_after_mismatch, "after_mismatch")
+    if not editable_only_state_after_mismatch:
+        raise RuntimeError("类型冲突失败后 editable-only 变量定义丢失")
+    if not report["editable_only_is_instance_editable_after_mismatch"]:
+        raise RuntimeError(f"类型冲突失败后 editable-only Instance Editable 被破坏: {report['editable_only_payload_after_mismatch']}")
+    if report["editable_only_has_expose_on_spawn_after_mismatch"]:
+        raise RuntimeError(f"类型冲突失败后 editable-only 变量错误出现 ExposeOnSpawn: {report['editable_only_payload_after_mismatch']}")
+    if not report["editable_only_generated_default_matches_after_mismatch"]:
+        raise RuntimeError(f"类型冲突失败后 editable-only 默认值被破坏: {report['editable_only_generated_default_value_after_mismatch']}")
 
     report["success"] = True
 except Exception as exc:

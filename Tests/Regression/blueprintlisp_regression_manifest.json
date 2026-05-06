@@ -260,8 +260,8 @@
       "expected_success": true,
       "uproject": "D:\\MCP\\MCP.uproject",
       "target": "/Game/Blueprint/BPLispTests/BP_VarDeclarationProbe :: EventGraph",
-      "issue": "顶层 var 过去只在 Validate 白名单里保留，但 import 不会自动创建 Blueprint 成员变量，也不支持在声明阶段写入默认值或 ExposeOnSpawn。后续又出现过 ExposeOnSpawn 先落 metadata、后补 Instance Editable，导致编译日志报警告的时序回归。",
-      "notes": "probe 在全新 Character 蓝图上导入 `(var AutoCreatedHealth float :default 42 :expose-on-spawn true)`，验证成员变量被创建、默认值生效、ExposeOnSpawn 与 Instance Editable 同时成立；回归 runner 还会检查命令日志中不得出现“Expose on Spawn 但未标记为 Instance Editable”的编译警告。随后再导入同名 bool 声明，要求失败且变量定义与图内容保持第一次成功导入后的状态。",
+      "issue": "顶层 var 过去只在 Validate 白名单里保留，但 import 不会自动创建 Blueprint 成员变量，也不支持在声明阶段写入默认值、Instance Editable 或 ExposeOnSpawn。后续又出现过 ExposeOnSpawn 先落 metadata、后补 Instance Editable，导致编译日志报警告的时序回归。",
+      "notes": "probe 在全新 Character 蓝图上同时导入 `(var AutoCreatedHealth float :default 42 :instance-editable true :expose-on-spawn true)` 与 `(var EditableOnlySpeed float :default 12 :instance-editable true)`，验证自动创建、默认值、ExposeOnSpawn 与非 spawn 场景下的 Instance Editable 保真；回归 runner 还会检查命令日志中不得出现“Expose on Spawn 但未标记为 Instance Editable”的编译警告。随后再导入同名 bool 声明，要求失败且变量定义与图内容保持第一次成功导入后的状态。",
       "forbidden_log_substrings": [
         "被标记为“Expose on Spawn（生成时公开）”，但未被标记为“Instance Editable（实例可编辑）”",
         "marked as 'Expose on Spawn' but not marked as 'Instance Editable'"
