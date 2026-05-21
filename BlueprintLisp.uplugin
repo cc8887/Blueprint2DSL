@@ -5,7 +5,7 @@
   "FriendlyName": "BlueprintLisp - Blueprint DSL Engine",
   "Description": "S-expression DSL for bidirectional conversion between Blueprint EventGraphs and LISP-like code. Runtime module: AST/Parser. Editor module: BP<->Lisp conversion.",
   "Category": "Programming",
-  "CreatedBy": "OpenClaw Research",
+  "CreatedBy": "ccc887",
   "CreatedByURL": "",
   "DocsURL": "",
   "MarketplaceURL": "",
