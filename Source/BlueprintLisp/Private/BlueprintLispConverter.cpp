@@ -8,6 +8,7 @@
 // Import (DSL->BP) is currently stubbed; Export (BP->DSL) is fully implemented.
 
 #include "BlueprintLispConverter.h"
+#include "BlueprintLispModule.h"
 
 #if WITH_EDITOR
 
@@ -59,6 +60,7 @@
 #include "Kismet/KismetSystemLibrary.h"
 #include "Kismet/KismetStringLibrary.h"
 #include "Kismet/GameplayStatics.h"
+#include "Framework/Application/SlateApplication.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/Character.h"
@@ -1570,6 +1572,110 @@ static void IMP_RecordCompileStatus(UBlueprint* Blueprint, FBPImportContext& Ctx
 	if (Blueprint->Status == BS_UpToDateWithWarnings)
 	{
 		Ctx.Warnings.Add(FString::Printf(TEXT("%s: Blueprint compile finished with warnings for %s"), *ContextLabel, *Blueprint->GetPathName()));
+	}
+}
+
+namespace
+{
+	const FName IMP_AutoLayoutBehaviorName(TEXT("AutoLayout"));
+
+	static BlueprintLispImportLifecycle::FImportLifecycleContext IMP_MakeLifecycleContext(
+		UBlueprint* Blueprint,
+		UEdGraph* Graph,
+		const FBlueprintLispConverter::FImportOptions& Options)
+	{
+		BlueprintLispImportLifecycle::FImportLifecycleContext Context;
+		Context.ImportSessionId = FGuid::NewGuid();
+		Context.TargetAsset = Blueprint;
+		Context.TargetGraph = Graph;
+		Context.ScopeName = Graph ? FName(*Graph->GetName()) : NAME_None;
+		Context.bIsFullRebuild = (Options.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph);
+		Context.bIsIncremental = !Context.bIsFullRebuild;
+		Context.bIsHeadless = IsRunningCommandlet() || !FSlateApplication::IsInitialized();
+		Context.bWillCompile = Options.bCompile;
+		if (Options.bAutoLayout)
+		{
+			Context.RequestedBehaviors.Add(IMP_AutoLayoutBehaviorName);
+		}
+		return Context;
+	}
+
+	static BlueprintLispImportLifecycle::FImportNodeChange IMP_MakeNodeChange(
+		UEdGraphNode* Node,
+		BlueprintLispImportLifecycle::EImportNodeChangeType ChangeType)
+	{
+		BlueprintLispImportLifecycle::FImportNodeChange Change;
+		Change.Node = Node;
+		Change.ChangeType = ChangeType;
+		return Change;
+	}
+
+	static void IMP_CollectNodeChanges(
+		const TSet<UEdGraphNode*>& PreExistingNodes,
+		UEdGraph* Graph,
+		TArray<BlueprintLispImportLifecycle::FImportNodeChange>& OutChanges)
+	{
+		if (!Graph)
+		{
+			return;
+		}
+
+		for (UEdGraphNode* Node : Graph->Nodes)
+		{
+			if (Node && !PreExistingNodes.Contains(Node))
+			{
+				OutChanges.Add(IMP_MakeNodeChange(Node, BlueprintLispImportLifecycle::EImportNodeChangeType::Added));
+			}
+		}
+	}
+
+	static void IMP_BroadcastNodePhase(
+		BlueprintLispImportLifecycle::EImportLifecyclePhase Phase,
+		const BlueprintLispImportLifecycle::FImportLifecycleContext& Context,
+		const TArray<BlueprintLispImportLifecycle::FImportNodeChange>& Changes)
+	{
+		if (!FBlueprintLispModule::IsAvailable())
+		{
+			return;
+		}
+
+		BlueprintLispImportLifecycle::FImportNodePhaseEvent Event;
+		Event.Phase = Phase;
+		Event.Context = Context;
+		Event.Changes = Changes;
+		FBlueprintLispModule::Get().BroadcastNodePhase(Event);
+	}
+
+	static void IMP_BroadcastPropertyPhase(
+		BlueprintLispImportLifecycle::EImportLifecyclePhase Phase,
+		const BlueprintLispImportLifecycle::FImportLifecycleContext& Context,
+		const TArray<BlueprintLispImportLifecycle::FImportPropertyChange>& Changes)
+	{
+		if (!FBlueprintLispModule::IsAvailable())
+		{
+			return;
+		}
+
+		BlueprintLispImportLifecycle::FImportPropertyPhaseEvent Event;
+		Event.Phase = Phase;
+		Event.Context = Context;
+		Event.Changes = Changes;
+		FBlueprintLispModule::Get().BroadcastPropertyPhase(Event);
+	}
+
+	static void IMP_BroadcastFinalizePhase(
+		BlueprintLispImportLifecycle::EImportLifecyclePhase Phase,
+		const BlueprintLispImportLifecycle::FImportLifecycleContext& Context)
+	{
+		if (!FBlueprintLispModule::IsAvailable())
+		{
+			return;
+		}
+
+		BlueprintLispImportLifecycle::FImportFinalizePhaseEvent Event;
+		Event.Phase = Phase;
+		Event.Context = Context;
+		FBlueprintLispModule::Get().BroadcastFinalizePhase(Event);
 	}
 }
 
@@ -7879,6 +7985,17 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	Ctx.Graph     = Graph;
 	Ctx.ImportMode = Options.ImportMode;
 
+	const BlueprintLispImportLifecycle::FImportLifecycleContext LifecycleContext =
+		IMP_MakeLifecycleContext(Blueprint, Graph, Options);
+	TSet<UEdGraphNode*> PreExistingNodes;
+	for (UEdGraphNode* ExistingNode : Graph->Nodes)
+	{
+		if (ExistingNode)
+		{
+			PreExistingNodes.Add(ExistingNode);
+		}
+	}
+	TArray<BlueprintLispImportLifecycle::FImportPropertyChange> PropertyChanges;
 
 	if (Options.bFailOnUnsupportedForm && !IMP_ValidateImportCoverage(PR.Nodes, Ctx))
 	{
@@ -7890,6 +8007,9 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	{
 		return IMP_FailFromContext(Ctx, TEXT("Import var declaration failed"));
 	}
+
+	IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreNodeChanges, LifecycleContext, {});
+	IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PrePropertyChanges, LifecycleContext, PropertyChanges);
 
 	if (Options.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
 	{
@@ -8138,11 +8258,18 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	// Mark blueprint modified
 	FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(Blueprint);
 
+	TArray<BlueprintLispImportLifecycle::FImportNodeChange> NodeChanges;
+	IMP_CollectNodeChanges(PreExistingNodes, Graph, NodeChanges);
+	IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges, LifecycleContext, NodeChanges);
+	IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostPropertyChanges, LifecycleContext, PropertyChanges);
+
 	// Optionally compile
 	if (Options.bCompile)
 	{
+		IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreFinalize, LifecycleContext);
 		FKismetEditorUtilities::CompileBlueprint(Blueprint, EBlueprintCompileOptions::SkipGarbageCollection);
 		IMP_RecordCompileStatus(Blueprint, Ctx, TEXT("Import"));
+		IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostFinalize, LifecycleContext);
 	}
 
 	if (Ctx.Errors.Num() > 0)
@@ -8182,6 +8309,19 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 	FBPImportContext ValidationCtx;
 	ValidationCtx.Graph = Graph;
 	ValidationCtx.Blueprint = Graph->GetTypedOuter<UBlueprint>();
+
+	const BlueprintLispImportLifecycle::FImportLifecycleContext LifecycleContext =
+		IMP_MakeLifecycleContext(ValidationCtx.Blueprint, Graph, Options);
+	TSet<UEdGraphNode*> PreExistingNodes;
+	for (UEdGraphNode* ExistingNode : Graph->Nodes)
+	{
+		if (ExistingNode)
+		{
+			PreExistingNodes.Add(ExistingNode);
+		}
+	}
+	TArray<BlueprintLispImportLifecycle::FImportPropertyChange> PropertyChanges;
+
 	if (Options.bFailOnUnsupportedForm && !IMP_ValidateImportCoverage(PR.Nodes, ValidationCtx))
 	{
 		return FBlueprintLispResult::Fail(ValidationCtx.Errors.Num() > 0 ? ValidationCtx.Errors[0] : TEXT("ImportGraph aborted due to unsupported DSL forms"));
@@ -8192,6 +8332,9 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 	{
 		return IMP_FailFromContext(ValidationCtx, TEXT("ImportGraph var declaration failed"));
 	}
+
+	IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreNodeChanges, LifecycleContext, {});
+	IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PrePropertyChanges, LifecycleContext, PropertyChanges);
 
 	if (Options.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph)
 	{
@@ -8298,10 +8441,17 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
+		TArray<BlueprintLispImportLifecycle::FImportNodeChange> NodeChanges;
+		IMP_CollectNodeChanges(PreExistingNodes, Graph, NodeChanges);
+		IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges, LifecycleContext, NodeChanges);
+		IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostPropertyChanges, LifecycleContext, PropertyChanges);
+
 		if (Options.bCompile)
 		{
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreFinalize, LifecycleContext);
 			FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::SkipGarbageCollection);
 			IMP_RecordCompileStatus(BP, Ctx, TEXT("ImportGraph(function)"));
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostFinalize, LifecycleContext);
 		}
 
 		if (Ctx.Errors.Num() > 0)
@@ -8385,10 +8535,17 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(BP);
 
+		TArray<BlueprintLispImportLifecycle::FImportNodeChange> NodeChanges;
+		IMP_CollectNodeChanges(PreExistingNodes, Graph, NodeChanges);
+		IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges, LifecycleContext, NodeChanges);
+		IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostPropertyChanges, LifecycleContext, PropertyChanges);
+
 		if (Options.bCompile)
 		{
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreFinalize, LifecycleContext);
 			FKismetEditorUtilities::CompileBlueprint(BP, EBlueprintCompileOptions::SkipGarbageCollection);
 			IMP_RecordCompileStatus(BP, Ctx, TEXT("ImportGraph(macro)"));
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostFinalize, LifecycleContext);
 		}
 
 		if (Ctx.Errors.Num() > 0)
@@ -8489,10 +8646,18 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 	if (OwnerBP)
 	{
 		FBlueprintEditorUtils::MarkBlueprintAsStructurallyModified(OwnerBP);
+
+		TArray<BlueprintLispImportLifecycle::FImportNodeChange> NodeChanges;
+		IMP_CollectNodeChanges(PreExistingNodes, Graph, NodeChanges);
+		IMP_BroadcastNodePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostNodeChanges, LifecycleContext, NodeChanges);
+		IMP_BroadcastPropertyPhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostPropertyChanges, LifecycleContext, PropertyChanges);
+
 		if (Options.bCompile)
 		{
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PreFinalize, LifecycleContext);
 			FKismetEditorUtilities::CompileBlueprint(OwnerBP, EBlueprintCompileOptions::SkipGarbageCollection);
 			IMP_RecordCompileStatus(OwnerBP, TransitionCtx, TEXT("ImportGraph(transition-cond)"));
+			IMP_BroadcastFinalizePhase(BlueprintLispImportLifecycle::EImportLifecyclePhase::PostFinalize, LifecycleContext);
 		}
 	}
 
