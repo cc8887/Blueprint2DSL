@@ -126,7 +126,7 @@ FString FLispNode::ToString(bool bPretty, int32 IndentLevel) const
 	case ELispNodeType::Keyword: return StringValue; // already includes ':'
 	case ELispNodeType::Number:
 		if (FMath::IsNearlyEqual(NumberValue, FMath::RoundToDouble(NumberValue)))
-			return FString::Printf(TEXT("%d"), (int64)NumberValue);
+			return FString::Printf(TEXT("%lld"), (long long)(int64)NumberValue);
 		return FString::SanitizeFloat(NumberValue);
 
 	case ELispNodeType::String:
