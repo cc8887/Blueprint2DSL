@@ -111,6 +111,12 @@ print(res.message)
 python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 ```
 
+## 相关插件
+
+- **AnimBP2FP**：动画蓝图 ⇄ AnimLang DSL 转换
+- **MatBP2FP**：材质蓝图 ⇄ MatLang DSL 转换
+- **BlueprintAutoLayout**：图节点自动排版。BlueprintLisp 通过导入生命周期钩子（`PostNodeChanges` 阶段）与之集成——当导入上下文请求 `AutoLayout` 行为时，导入完成后会自动整理新增/变更节点的布局，无需手动排版。该集成是可选的：BlueprintAutoLayout 未启用时，导入流程正常工作，只是不自动排版。
+
 ## 注意
 
 - 建议先 `validate_dsl`，再导入
