@@ -1,4 +1,4 @@
-﻿// Copyright (c) 2026 OpenClaw Research. All Rights Reserved.
+// Copyright (c) 2026 OpenClaw Research. All Rights Reserved.
 // BlueprintLispTests.cpp - UE Automation Tests for BlueprintLisp AST/Parser
 //
 // Run via:
@@ -453,6 +453,138 @@ bool FConverter_Validate_MultipleEvents::RunTest(const FString& Parameters)
 	FString Code = TEXT("(event BeginPlay)\n(event EndPlay)\n(func MyFunc)");
 	auto R = FBlueprintLispConverter::Validate(Code);
 	TestTrue(TEXT("multiple valid forms"), R.bSuccess);
+	return true;
+}
+
+// ============================================================================
+// Import-Lifecycle Hook Integration Tests
+//
+// Guard the producer-side contract that BlueprintAutoLayout relies on: after
+// an EventGraph import that touches nodes, BlueprintLisp broadcasts a
+// PostNodeChanges event carrying the changed UEdGraphNodes and the
+// "AutoLayout" behavior token. BlueprintAutoLayout's FBlueprintLispAutoLayoutHook
+// consumes this to run LayoutSelection over the changed nodes.
+// ============================================================================
+
+#include "BlueprintLispModule.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+
+namespace BlueprintLispLifecycleTest
+{
+	using namespace BlueprintLispImportLifecycle;
+
+	class FRecordingHook : public IImportLifecycleHook
+	{
+	public:
+		explicit FRecordingHook(int32 InPriority = 0) : Priority(InPriority) {}
+
+		virtual int32 GetPriority(EImportLifecyclePhase Phase) const override
+		{
+			return Phase == EImportLifecyclePhase::PostNodeChanges ? Priority : 0;
+		}
+
+		virtual void OnNodePhase(const FImportNodePhaseEvent& Event) override
+		{
+			NodePhaseCount++;
+			LastPhase = Event.Phase;
+			LastBehaviors = Event.Context.RequestedBehaviors;
+			LastChangeCount = Event.Changes.Num();
+			OrderToken = NextGlobalOrder++;
+		}
+
+		int32 Priority = 0;
+		int32 NodePhaseCount = 0;
+		EImportLifecyclePhase LastPhase = EImportLifecyclePhase::PreNodeChanges;
+		TSet<FName> LastBehaviors;
+		int32 LastChangeCount = 0;
+		int32 OrderToken = -1;
+
+		static int32 NextGlobalOrder;
+	};
+
+	int32 FRecordingHook::NextGlobalOrder = 0;
+}
+
+BL_TEST(Lifecycle_PostNodeChanges_DeliveredWithAutoLayoutBehavior)
+bool FLifecycle_PostNodeChanges_DeliveredWithAutoLayoutBehavior::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispImportLifecycle;
+	using namespace BlueprintLispLifecycleTest;
+
+	if (!FBlueprintLispModule::IsAvailable())
+	{
+		AddWarning(TEXT("BlueprintLisp module not loaded; skipping lifecycle test."));
+		return true;
+	}
+
+	FBlueprintLispModule& Module = FBlueprintLispModule::Get();
+
+	TSharedRef<FRecordingHook> Hook = MakeShared<FRecordingHook>();
+	FImportLifecycleHookHandle Handle = Module.RegisterImportLifecycleHook(Hook);
+	TestTrue(TEXT("hook handle valid"), Handle.IsValid());
+
+	UEdGraph* Graph = NewObject<UEdGraph>(GetTransientPackage());
+	UEdGraphNode* ChangedNode = NewObject<UEdGraphNode>(Graph);
+	Graph->Nodes.Add(ChangedNode);
+
+	FImportNodePhaseEvent Event;
+	Event.Phase = EImportLifecyclePhase::PostNodeChanges;
+	Event.Context.TargetGraph = Graph;
+	Event.Context.bIsIncremental = true;
+	Event.Context.RequestedBehaviors.Add(FName(TEXT("AutoLayout")));
+	FImportNodeChange Change;
+	Change.Node = ChangedNode;
+	Change.ChangeType = EImportNodeChangeType::Added;
+	Event.Changes.Add(Change);
+
+	Module.BroadcastNodePhase(Event);
+
+	TestEqual(TEXT("hook received exactly one node phase"), Hook->NodePhaseCount, 1);
+	TestEqual(TEXT("phase is PostNodeChanges"),
+		(int32)Hook->LastPhase, (int32)EImportLifecyclePhase::PostNodeChanges);
+	TestTrue(TEXT("AutoLayout behavior propagated"),
+		Hook->LastBehaviors.Contains(FName(TEXT("AutoLayout"))));
+	TestEqual(TEXT("changed-node count propagated"), Hook->LastChangeCount, 1);
+
+	Module.UnregisterImportLifecycleHook(Handle);
+
+	Module.BroadcastNodePhase(Event);
+	TestEqual(TEXT("no delivery after unregister"), Hook->NodePhaseCount, 1);
+
+	return true;
+}
+
+BL_TEST(Lifecycle_HookPriorityOrdering)
+bool FLifecycle_HookPriorityOrdering::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispImportLifecycle;
+	using namespace BlueprintLispLifecycleTest;
+
+	if (!FBlueprintLispModule::IsAvailable())
+	{
+		AddWarning(TEXT("BlueprintLisp module not loaded; skipping priority test."));
+		return true;
+	}
+
+	FBlueprintLispModule& Module = FBlueprintLispModule::Get();
+
+	FRecordingHook::NextGlobalOrder = 0;
+	TSharedRef<FRecordingHook> EarlyHook = MakeShared<FRecordingHook>(/*Priority*/ 100);
+	TSharedRef<FRecordingHook> LateHook  = MakeShared<FRecordingHook>(/*Priority*/ -10);
+
+	FImportLifecycleHookHandle LateHandle  = Module.RegisterImportLifecycleHook(LateHook);
+	FImportLifecycleHookHandle EarlyHandle = Module.RegisterImportLifecycleHook(EarlyHook);
+
+	FImportNodePhaseEvent Event;
+	Event.Phase = EImportLifecyclePhase::PostNodeChanges;
+	Module.BroadcastNodePhase(Event);
+
+	TestTrue(TEXT("high-priority hook ran before low-priority hook"),
+		EarlyHook->OrderToken < LateHook->OrderToken);
+
+	Module.UnregisterImportLifecycleHook(LateHandle);
+	Module.UnregisterImportLifecycleHook(EarlyHandle);
 	return true;
 }
 
