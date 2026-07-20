@@ -7956,7 +7956,7 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	// Locate the target graph
 	UEdGraph* Graph = nullptr;
 	for (UEdGraph* G : Blueprint->UbergraphPages)
-		if (G && (G->GetName() == GraphName || GraphName.Equals(TEXT("EventGraph"), ESearchCase::IgnoreCase)))
+		if (G && G->GetName() == GraphName)
 			{ Graph = G; break; }
 	if (!Graph)
 		for (UEdGraph* G : Blueprint->FunctionGraphs)
