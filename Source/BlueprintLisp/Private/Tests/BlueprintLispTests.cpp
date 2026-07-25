@@ -467,8 +467,190 @@ bool FConverter_Validate_MultipleEvents::RunTest(const FString& Parameters)
 // ============================================================================
 
 #include "BlueprintLispModule.h"
+#include "BlueprintLispConverter.h"
+#include "EdGraphSchema_K2.h"
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
+#include "Engine/Blueprint.h"
+#include "Engine/BlueprintGeneratedClass.h"
+#include "K2Node_FunctionEntry.h"
+#include "K2Node_FunctionResult.h"
+#include "K2Node_IfThenElse.h"
+#include "K2Node_Select.h"
+#include "K2Node_Composite.h"
+#include "K2Node_Tunnel.h"
+#include "K2Node_CallFunction.h"
+#include "K2Node_GenericCreateObject.h"
+#include "K2Node_VariableSet.h"
+#include "Curves/CurveFloat.h"
+#include "Animation/AnimInstance.h"
+#include "Kismet/KismetMathLibrary.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "Kismet2/BlueprintEditorUtils.h"
+#include "Kismet2/KismetEditorUtilities.h"
+
+BL_TEST(FunctionImport_PreservesNativeParentOverrideIdentity)
+bool FFunctionImport_PreservesNativeParentOverrideIdentity::RunTest(const FString& Parameters)
+{
+	UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
+		UAnimInstance::StaticClass(), GetTransientPackage(), TEXT("ABP_BL_NativeOverride"), BPTYPE_Normal,
+		UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass(),
+		TEXT("BlueprintLispNativeOverrideTest"));
+	TestNotNull(TEXT("transient AnimInstance Blueprint is created"), Blueprint);
+	if (!Blueprint) return false;
+
+	UEdGraph* Graph = FBlueprintEditorUtils::CreateNewGraph(
+		Blueprint, TEXT("BlueprintThreadSafeUpdateAnimation"), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+	FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, Graph, true, nullptr);
+
+	UK2Node_FunctionEntry* Entry = nullptr;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UK2Node_FunctionEntry* Candidate = Cast<UK2Node_FunctionEntry>(Node))
+		{
+			Entry = Candidate;
+			break;
+		}
+	}
+	TestNotNull(TEXT("function entry exists"), Entry);
+	if (!Entry) return false;
+
+	FBlueprintLispConverter::FImportOptions Options;
+	Options.bAutoLayout = false;
+	Options.bCompile = false;
+	Options.bSignatureOnly = true;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(
+		Graph,
+		TEXT("(function BlueprintThreadSafeUpdateAnimation :param (DeltaTime float))"),
+		Options);
+	TestTrue(TEXT("native override signature imports"), Imported.bSuccess);
+
+	UFunction* ParentFunction = UAnimInstance::StaticClass()->FindFunctionByName(TEXT("BlueprintThreadSafeUpdateAnimation"));
+	TestNotNull(TEXT("native parent function exists"), ParentFunction);
+	TestTrue(TEXT("function entry resolves to the native parent override"),
+		ParentFunction && Entry->FunctionReference.ResolveMember<UFunction>(Blueprint->ParentClass) == ParentFunction);
+	return true;
+}
+
+BL_TEST(FunctionCall_SplitStructOutputPreservesParentType)
+bool FFunctionCall_SplitStructOutputPreservesParentType::RunTest(const FString& Parameters)
+{
+	auto MakeRotatorFunction = [](const FName BlueprintName, UEdGraph*& OutGraph, UK2Node_FunctionResult*& OutResult)
+	{
+		UBlueprint* Blueprint = FKismetEditorUtilities::CreateBlueprint(
+			UObject::StaticClass(), GetTransientPackage(), BlueprintName, BPTYPE_Normal,
+			UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass(),
+			TEXT("BlueprintLispSplitStructOutputTest"));
+		OutGraph = FBlueprintEditorUtils::CreateNewGraph(
+			Blueprint, TEXT("SplitTransformRotation"), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+		FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Blueprint, OutGraph, true, nullptr);
+		for (UEdGraphNode* Node : OutGraph->Nodes)
+		{
+			OutResult = Cast<UK2Node_FunctionResult>(Node);
+			if (OutResult) break;
+		}
+		if (!OutResult)
+		{
+			OutResult = NewObject<UK2Node_FunctionResult>(OutGraph);
+			OutResult->CreateNewGuid();
+			OutGraph->AddNode(OutResult, false, false);
+			OutResult->PostPlacedNewNode();
+			OutResult->AllocateDefaultPins();
+		}
+		FEdGraphPinType RotatorType;
+		RotatorType.PinCategory = UEdGraphSchema_K2::PC_Struct;
+		RotatorType.PinSubCategoryObject = TBaseStructure<FRotator>::Get();
+		OutResult->CreateUserDefinedPin(TEXT("ReturnValue"), RotatorType, EGPD_Input, false);
+		return Blueprint;
+	};
+
+	UEdGraph* SourceGraph = nullptr;
+	UK2Node_FunctionResult* SourceResult = nullptr;
+	UBlueprint* SourceBlueprint = MakeRotatorFunction(TEXT("BP_BL_SplitStructSource"), SourceGraph, SourceResult);
+	TestNotNull(TEXT("source graph exists"), SourceGraph);
+	TestNotNull(TEXT("source result exists"), SourceResult);
+	if (!SourceBlueprint || !SourceGraph || !SourceResult) return false;
+	UK2Node_FunctionEntry* SourceEntry = nullptr;
+	for (UEdGraphNode* Node : SourceGraph->Nodes)
+	{
+		SourceEntry = Cast<UK2Node_FunctionEntry>(Node);
+		if (SourceEntry) break;
+	}
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	TestTrue(TEXT("function execution path connects entry to result"),
+		SourceEntry && Schema
+		&& Schema->TryCreateConnection(
+			SourceEntry->FindPin(UEdGraphSchema_K2::PN_Then, EGPD_Output),
+			SourceResult->FindPin(UEdGraphSchema_K2::PN_Execute, EGPD_Input)));
+
+	UK2Node_CallFunction* MakeTransform = NewObject<UK2Node_CallFunction>(SourceGraph);
+	MakeTransform->SetFromFunction(UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("MakeTransform")));
+	MakeTransform->CreateNewGuid();
+	SourceGraph->AddNode(MakeTransform, false, false);
+	MakeTransform->AllocateDefaultPins();
+	UEdGraphPin* TransformOutput = MakeTransform->GetReturnValuePin();
+	TestNotNull(TEXT("MakeTransform return pin exists"), TransformOutput);
+	if (!TransformOutput || !Schema) return false;
+	const_cast<UEdGraphSchema_K2*>(Schema)->SplitPin(TransformOutput, false);
+
+	UEdGraphPin* RotationChild = nullptr;
+	for (UEdGraphPin* SubPin : TransformOutput->SubPins)
+	{
+		if (SubPin && SubPin->PinName.ToString().Contains(TEXT("Rotation")))
+		{
+			RotationChild = SubPin;
+			break;
+		}
+	}
+	TestNotNull(TEXT("split Rotation child exists"), RotationChild);
+
+	UK2Node_CallFunction* ComposeRotators = NewObject<UK2Node_CallFunction>(SourceGraph);
+	ComposeRotators->SetFromFunction(UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("ComposeRotators")));
+	ComposeRotators->CreateNewGuid();
+	SourceGraph->AddNode(ComposeRotators, false, false);
+	ComposeRotators->AllocateDefaultPins();
+	UEdGraphPin* ComposeInput = ComposeRotators->FindPin(TEXT("A"), EGPD_Input);
+	UEdGraphPin* ComposeOutput = ComposeRotators->GetReturnValuePin();
+	UEdGraphPin* ResultInput = SourceResult->FindPin(TEXT("ReturnValue"), EGPD_Input);
+	TestTrue(TEXT("split child connects to rotator consumer"),
+		RotationChild && ComposeInput && Schema->TryCreateConnection(RotationChild, ComposeInput));
+	TestTrue(TEXT("consumer connects to function result"),
+		ComposeOutput && ResultInput && Schema->TryCreateConnection(ComposeOutput, ResultInput));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(SourceGraph, ExportOptions);
+	TestTrue(TEXT("split struct graph exports"), Exported.bSuccess);
+	TestTrue(TEXT("split output uses explicit break-struct"), Exported.LispCode.Contains(TEXT("(break-struct :struct Transform")));
+	TestTrue(TEXT("call result type describes the selected parent output"),
+		Exported.LispCode.Contains(TEXT(":out-pin \"ReturnValue\" :result-type-object \"/Script/CoreUObject.Transform\"")));
+
+	UEdGraph* DestinationGraph = nullptr;
+	UK2Node_FunctionResult* DestinationResult = nullptr;
+	UBlueprint* DestinationBlueprint = MakeRotatorFunction(TEXT("BP_BL_SplitStructDestination"), DestinationGraph, DestinationResult);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(DestinationGraph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("split struct graph imports"), Imported.bSuccess);
+
+	bool bHasMismatchedStructLink = false;
+	for (UEdGraphNode* Node : DestinationGraph->Nodes)
+	{
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (!Pin || Pin->Direction != EGPD_Output || Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) continue;
+			for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+			{
+				bHasMismatchedStructLink |= LinkedPin && LinkedPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct
+					&& Pin->PinType.PinSubCategoryObject != LinkedPin->PinType.PinSubCategoryObject;
+			}
+		}
+	}
+	TestFalse(TEXT("import has no mismatched struct connection"), bHasMismatchedStructLink);
+	return true;
+}
 
 namespace BlueprintLispLifecycleTest
 {
@@ -504,6 +686,670 @@ namespace BlueprintLispLifecycleTest
 	};
 
 	int32 FRecordingHook::NextGlobalOrder = 0;
+}
+
+namespace BlueprintLispFunctionReturnTest
+{
+	struct FFixture
+	{
+		UBlueprint* Blueprint = nullptr;
+		UEdGraph* Graph = nullptr;
+		UK2Node_FunctionEntry* Entry = nullptr;
+		UK2Node_FunctionResult* Result = nullptr;
+		UEdGraphPin* InputPin = nullptr;
+		UEdGraphPin* ReturnPin = nullptr;
+	};
+
+	static UEdGraphPin* FindPin(UEdGraphNode* Node, const FName Name, EEdGraphPinDirection Direction)
+	{
+		if (!Node) return nullptr;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->PinName == Name && Pin->Direction == Direction)
+			{
+				return Pin;
+			}
+		}
+		return nullptr;
+	}
+
+	static FFixture MakeFixture(const FName BlueprintName, bool bConnectData)
+	{
+		FFixture Fixture;
+		Fixture.Blueprint = FKismetEditorUtilities::CreateBlueprint(
+			UObject::StaticClass(), GetTransientPackage(), BlueprintName, BPTYPE_Normal,
+			UBlueprint::StaticClass(), UBlueprintGeneratedClass::StaticClass(),
+			FName(TEXT("BlueprintLispFunctionReturnTest")));
+		Fixture.Graph = FBlueprintEditorUtils::CreateNewGraph(
+			Fixture.Blueprint, TEXT("EchoBool"), UEdGraph::StaticClass(), UEdGraphSchema_K2::StaticClass());
+		FBlueprintEditorUtils::AddFunctionGraph<UFunction>(Fixture.Blueprint, Fixture.Graph, true, nullptr);
+
+		for (UEdGraphNode* Node : Fixture.Graph->Nodes)
+		{
+			if (!Fixture.Entry) Fixture.Entry = Cast<UK2Node_FunctionEntry>(Node);
+			if (!Fixture.Result) Fixture.Result = Cast<UK2Node_FunctionResult>(Node);
+		}
+		if (!Fixture.Result)
+		{
+			Fixture.Result = NewObject<UK2Node_FunctionResult>(Fixture.Graph);
+			Fixture.Result->CreateNewGuid();
+			Fixture.Result->PostPlacedNewNode();
+			Fixture.Result->AllocateDefaultPins();
+			Fixture.Graph->AddNode(Fixture.Result, false, false);
+		}
+
+		FEdGraphPinType BoolType;
+		BoolType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+		if (Fixture.Entry)
+		{
+			Fixture.Entry->CreateUserDefinedPin(TEXT("Input"), BoolType, EGPD_Output, false);
+			Fixture.InputPin = FindPin(Fixture.Entry, TEXT("Input"), EGPD_Output);
+		}
+		if (Fixture.Result)
+		{
+			Fixture.Result->CreateUserDefinedPin(TEXT("ReturnValue"), BoolType, EGPD_Input, false);
+			Fixture.ReturnPin = FindPin(Fixture.Result, TEXT("ReturnValue"), EGPD_Input);
+		}
+
+		const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+		if (Schema && Fixture.Entry && Fixture.Result)
+		{
+			UEdGraphPin* ThenPin = FindPin(Fixture.Entry, UEdGraphSchema_K2::PN_Then, EGPD_Output);
+			UEdGraphPin* ExecutePin = FindPin(Fixture.Result, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+			if (ThenPin && ExecutePin) Schema->TryCreateConnection(ThenPin, ExecutePin);
+			if (bConnectData && Fixture.InputPin && Fixture.ReturnPin)
+			{
+				Schema->TryCreateConnection(Fixture.InputPin, Fixture.ReturnPin);
+			}
+		}
+		return Fixture;
+	}
+
+	static UK2Node_FunctionResult* AddBoolResult(FFixture& Fixture, const FString& DefaultValue)
+	{
+		UK2Node_FunctionResult* Result = NewObject<UK2Node_FunctionResult>(Fixture.Graph);
+		Result->CreateNewGuid();
+		Result->PostPlacedNewNode();
+		Result->AllocateDefaultPins();
+		Fixture.Graph->AddNode(Result, false, false);
+
+		FEdGraphPinType BoolType;
+		BoolType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+		UEdGraphPin* ReturnPin = Result->CreateUserDefinedPin(TEXT("ReturnValue"), BoolType, EGPD_Input, false);
+		if (ReturnPin)
+		{
+			ReturnPin->DefaultValue = DefaultValue;
+		}
+		return Result;
+	}
+}
+
+BL_TEST(FunctionReturn_DirectParameterRoundTrips)
+bool FFunctionReturn_DirectParameterRoundTrips::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	const FFixture Source = MakeFixture(TEXT("BP_BL_ReturnSource"), true);
+	TestNotNull(TEXT("source function entry exists"), Source.Entry);
+	TestNotNull(TEXT("source function result exists"), Source.Result);
+	TestTrue(TEXT("source return is connected"), Source.ReturnPin && Source.ReturnPin->LinkedTo.Contains(Source.InputPin));
+	if (!Source.Graph || !Source.ReturnPin || !Source.InputPin) return false;
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("source function exports"), Exported.bSuccess);
+	TestTrue(TEXT("function result uses explicit return form"), Exported.LispCode.Contains(TEXT("(return ")));
+	TestTrue(TEXT("return value preserves the parameter expression"),
+		Exported.LispCode.Contains(TEXT(":value (ReturnValue Input)")));
+	TestFalse(TEXT("localized generic return fallback is absent"), Exported.LispCode.Contains(TEXT("返回节点")));
+
+	const FFixture Destination = MakeFixture(TEXT("BP_BL_ReturnDestination"), false);
+	TestTrue(TEXT("destination starts disconnected"), Destination.ReturnPin && Destination.ReturnPin->LinkedTo.IsEmpty());
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("explicit return form imports"), Imported.bSuccess);
+	UEdGraphPin* ImportedInputPin = FindPin(Destination.Entry, TEXT("Input"), EGPD_Output);
+	UEdGraphPin* ImportedReturnPin = FindPin(Destination.Result, TEXT("ReturnValue"), EGPD_Input);
+	TestTrue(TEXT("import reconnects FunctionEntry to FunctionResult"),
+		ImportedReturnPin && ImportedReturnPin->LinkedTo.Contains(ImportedInputPin));
+
+	const FBlueprintLispResult ReExported = FBlueprintLispConverter::ExportGraph(Destination.Graph, ExportOptions);
+	TestTrue(TEXT("imported function re-exports"), ReExported.bSuccess);
+	TestTrue(TEXT("re-export preserves the return expression"),
+		ReExported.LispCode.Contains(TEXT(":value (ReturnValue Input)")));
+	return true;
+}
+
+BL_TEST(GenericCreateObject_RoundTripsExecAndResultDataflow)
+bool FGenericCreateObject_RoundTripsExecAndResultDataflow::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_CreateObjectSource"), true);
+	if (!Source.Blueprint || !Source.Graph || !Source.Entry || !Source.Result) return false;
+
+	FEdGraphPinType ObjectType;
+	ObjectType.PinCategory = UEdGraphSchema_K2::PC_Object;
+	ObjectType.PinSubCategoryObject = UCurveFloat::StaticClass();
+	TestTrue(TEXT("CreatedObject member variable added"),
+		FBlueprintEditorUtils::AddMemberVariable(Source.Blueprint, TEXT("CreatedObject"), ObjectType));
+
+	UK2Node_GenericCreateObject* CreateNode = NewObject<UK2Node_GenericCreateObject>(Source.Graph);
+	CreateNode->CreateNewGuid();
+	CreateNode->PostPlacedNewNode();
+	CreateNode->AllocateDefaultPins();
+	Source.Graph->AddNode(CreateNode, false, false);
+	UEdGraphPin* ClassPin = CreateNode->GetClassPin();
+	TestNotNull(TEXT("create-object class pin exists"), ClassPin);
+	if (ClassPin)
+	{
+		ClassPin->DefaultObject = UCurveFloat::StaticClass();
+		CreateNode->PinDefaultValueChanged(ClassPin);
+	}
+
+	UK2Node_VariableSet* SetNode = NewObject<UK2Node_VariableSet>(Source.Graph);
+	SetNode->VariableReference.SetSelfMember(TEXT("CreatedObject"));
+	SetNode->CreateNewGuid();
+	SetNode->PostPlacedNewNode();
+	SetNode->AllocateDefaultPins();
+	Source.Graph->AddNode(SetNode, false, false);
+
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	UEdGraphPin* EntryThen = FindPin(Source.Entry, UEdGraphSchema_K2::PN_Then, EGPD_Output);
+	UEdGraphPin* ResultExecute = FindPin(Source.Result, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	if (EntryThen) EntryThen->BreakAllPinLinks();
+	if (ResultExecute) ResultExecute->BreakAllPinLinks();
+	TestTrue(TEXT("entry connects to create-object"), Schema && Schema->TryCreateConnection(EntryThen, CreateNode->GetExecPin()));
+	TestTrue(TEXT("create-object connects to variable set"), Schema && Schema->TryCreateConnection(CreateNode->GetThenPin(), SetNode->GetExecPin()));
+	TestTrue(TEXT("variable set connects to function result"), Schema && Schema->TryCreateConnection(SetNode->GetThenPin(), ResultExecute));
+	UEdGraphPin* SetValuePin = FindPin(SetNode, TEXT("CreatedObject"), EGPD_Input);
+	TestTrue(TEXT("created object result feeds variable set"), Schema && Schema->TryCreateConnection(CreateNode->GetResultPin(), SetValuePin));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("generic create object graph exports without omission"), Exported.bSuccess);
+	TestTrue(TEXT("generic create object has explicit DSL form"), Exported.LispCode.Contains(TEXT("(create-object ")));
+	TestTrue(TEXT("created class is preserved"), Exported.LispCode.Contains(UCurveFloat::StaticClass()->GetPathName()));
+	if (!Exported.bSuccess) return false;
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_CreateObjectDestination"), true);
+	TestTrue(TEXT("destination CreatedObject variable added"),
+		FBlueprintEditorUtils::AddMemberVariable(Destination.Blueprint, TEXT("CreatedObject"), ObjectType));
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("generic create object DSL imports"), Imported.bSuccess);
+
+	UK2Node_GenericCreateObject* ImportedCreateNode = nullptr;
+	UK2Node_VariableSet* ImportedSetNode = nullptr;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		if (!ImportedCreateNode) ImportedCreateNode = Cast<UK2Node_GenericCreateObject>(Node);
+		if (!ImportedSetNode) ImportedSetNode = Cast<UK2Node_VariableSet>(Node);
+	}
+	TestNotNull(TEXT("import restores GenericCreateObject node"), ImportedCreateNode);
+	TestNotNull(TEXT("import restores variable set node"), ImportedSetNode);
+	if (ImportedCreateNode)
+	{
+		TestEqual(TEXT("import restores class to spawn"), ImportedCreateNode->GetClassToSpawn(), UCurveFloat::StaticClass());
+	}
+	if (ImportedCreateNode && ImportedSetNode)
+	{
+		UEdGraphPin* ImportedValuePin = FindPin(ImportedSetNode, TEXT("CreatedObject"), EGPD_Input);
+		TestTrue(TEXT("import restores result dataflow"),
+			ImportedValuePin && ImportedValuePin->LinkedTo.Contains(ImportedCreateNode->GetResultPin()));
+	}
+
+	const FBlueprintLispResult ReExported = FBlueprintLispConverter::ExportGraph(Destination.Graph, ExportOptions);
+	TestTrue(TEXT("imported create-object graph re-exports"), ReExported.bSuccess);
+	TestTrue(TEXT("re-export preserves create-object form"), ReExported.LispCode.Contains(TEXT("(create-object ")));
+	return true;
+}
+
+BL_TEST(FunctionReturn_CreatesMissingResultFromSignature)
+bool FFunctionReturn_CreatesMissingResultFromSignature::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	const FFixture Source = MakeFixture(TEXT("BP_BL_MissingResultSource"), true);
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("source function exports"), Exported.bSuccess);
+	if (!Exported.bSuccess) return false;
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_MissingResultDestination"), false);
+	Destination.Graph->RemoveNode(Destination.Result);
+	TestFalse(TEXT("destination has no function result before import"),
+		Destination.Graph->Nodes.ContainsByPredicate([](const UEdGraphNode* Node) { return Node && Node->IsA<UK2Node_FunctionResult>(); }));
+
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	if (!Imported.bSuccess) AddError(TEXT("missing-result import: ") + Imported.Error);
+	TestTrue(TEXT("function import creates missing result"), Imported.bSuccess);
+
+	UK2Node_FunctionResult* CreatedResult = nullptr;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		if (UK2Node_FunctionResult* Candidate = Cast<UK2Node_FunctionResult>(Node))
+		{
+			CreatedResult = Candidate;
+			break;
+		}
+	}
+	TestNotNull(TEXT("result node exists after import"), CreatedResult);
+	UEdGraphPin* CreatedReturnPin = FindPin(CreatedResult, TEXT("ReturnValue"), EGPD_Input);
+	UEdGraphPin* EntryInputPin = FindPin(Destination.Entry, TEXT("Input"), EGPD_Output);
+	TestTrue(TEXT("created result restores return dataflow"),
+		CreatedReturnPin && CreatedReturnPin->LinkedTo.Contains(EntryInputPin));
+	return true;
+}
+
+BL_TEST(FunctionReturn_BranchingResultsRoundTrip)
+bool FFunctionReturn_BranchingResultsRoundTrip::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_BranchReturnSource"), false);
+	UK2Node_FunctionResult* FalseResult = AddBoolResult(Source, TEXT("false"));
+	UK2Node_IfThenElse* Branch = NewObject<UK2Node_IfThenElse>(Source.Graph);
+	Branch->CreateNewGuid();
+	Branch->PostPlacedNewNode();
+	Branch->AllocateDefaultPins();
+	Source.Graph->AddNode(Branch, false, false);
+
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	UEdGraphPin* EntryThen = FindPin(Source.Entry, UEdGraphSchema_K2::PN_Then, EGPD_Output);
+	UEdGraphPin* FirstExecute = FindPin(Source.Result, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	UEdGraphPin* SecondExecute = FindPin(FalseResult, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	if (EntryThen) EntryThen->BreakAllPinLinks();
+	if (FirstExecute) FirstExecute->BreakAllPinLinks();
+	TestTrue(TEXT("entry connects to branch"), Schema && EntryThen && Schema->TryCreateConnection(EntryThen, Branch->GetExecPin()));
+	TestTrue(TEXT("input drives branch condition"), Schema && Source.InputPin && Schema->TryCreateConnection(Source.InputPin, Branch->GetConditionPin()));
+	TestTrue(TEXT("true branch reaches first result"), Schema && FirstExecute && Schema->TryCreateConnection(Branch->GetThenPin(), FirstExecute));
+	TestTrue(TEXT("false branch reaches second result"), Schema && SecondExecute && Schema->TryCreateConnection(Branch->GetElsePin(), SecondExecute));
+	TestTrue(TEXT("true result returns input"), Schema && Source.ReturnPin && Schema->TryCreateConnection(Source.InputPin, Source.ReturnPin));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("branching function exports"), Exported.bSuccess);
+	TestTrue(TEXT("true branch contains a return value"), Exported.LispCode.Contains(TEXT(":true (return :value (ReturnValue Input)")));
+	TestTrue(TEXT("false branch contains the default return value"), Exported.LispCode.Contains(TEXT(":false (return :value (ReturnValue false)")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_BranchReturnDestination"), false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("both function result paths import"), Imported.bSuccess);
+
+	int32 ResultCount = 0;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		ResultCount += Node && Node->IsA<UK2Node_FunctionResult>() ? 1 : 0;
+	}
+	TestEqual(TEXT("import creates both FunctionResult nodes"), ResultCount, 2);
+	const FBlueprintLispResult ReExported = FBlueprintLispConverter::ExportGraph(Destination.Graph, ExportOptions);
+	TestTrue(TEXT("branching function re-exports"), ReExported.bSuccess);
+	TestTrue(TEXT("re-export keeps the false default"), ReExported.LispCode.Contains(TEXT(":false (return :value (ReturnValue false)")));
+	return true;
+}
+
+BL_TEST(FunctionReturn_UnconnectedBoolExportsFalse)
+bool FFunctionReturn_UnconnectedBoolExportsFalse::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Fixture = MakeFixture(TEXT("BP_BL_DefaultReturn"), false);
+	Fixture.ReturnPin->DefaultValue.Empty();
+	Fixture.ReturnPin->AutogeneratedDefaultValue.Empty();
+
+	FBlueprintLispConverter::FExportOptions Options;
+	Options.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Fixture.Graph, Options);
+	TestTrue(TEXT("default bool function exports"), Exported.bSuccess);
+	TestTrue(TEXT("unconnected bool return is explicit false"),
+		Exported.LispCode.Contains(TEXT(":value (ReturnValue false)")));
+	return true;
+}
+
+BL_TEST(FunctionReturn_UnknownConnectedSourceFailsExport)
+bool FFunctionReturn_UnknownConnectedSourceFailsExport::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Fixture = MakeFixture(TEXT("BP_BL_UnsupportedReturn"), false);
+	UEdGraphNode* UnsupportedSource = NewObject<UEdGraphNode>(Fixture.Graph);
+	UnsupportedSource->CreateNewGuid();
+	UEdGraphPin* UnsupportedOutput = UnsupportedSource->CreatePin(
+		EGPD_Output, UEdGraphSchema_K2::PC_Boolean, TEXT("Value"));
+	Fixture.Graph->AddNode(UnsupportedSource, false, false);
+	if (UnsupportedOutput && Fixture.ReturnPin)
+	{
+		UnsupportedOutput->MakeLinkTo(Fixture.ReturnPin);
+	}
+	TestTrue(TEXT("unsupported source connects to return"),
+		UnsupportedOutput && Fixture.ReturnPin && Fixture.ReturnPin->LinkedTo.Contains(UnsupportedOutput));
+
+	FBlueprintLispConverter::FExportOptions Options;
+	Options.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Fixture.Graph, Options);
+	TestFalse(TEXT("connected unrepresentable return source is a hard export failure"), Exported.bSuccess);
+	TestTrue(TEXT("failure identifies FunctionResult pin"), Exported.Error.Contains(TEXT("ReturnValue")));
+	return true;
+}
+
+BL_TEST(FunctionReturn_NestedUnknownSourceFailsExport)
+bool FFunctionReturn_NestedUnknownSourceFailsExport::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Fixture = MakeFixture(TEXT("BP_BL_NestedUnsupportedReturn"), false);
+
+	UEdGraphNode* UnsupportedSource = NewObject<UEdGraphNode>(Fixture.Graph);
+	UnsupportedSource->CreateNewGuid();
+	UEdGraphPin* UnsupportedOutput = UnsupportedSource->CreatePin(
+		EGPD_Output, UEdGraphSchema_K2::PC_Boolean, TEXT("Value"));
+	Fixture.Graph->AddNode(UnsupportedSource, false, false);
+
+	UK2Node_Select* SelectNode = NewObject<UK2Node_Select>(Fixture.Graph);
+	SelectNode->CreateNewGuid();
+	SelectNode->PostPlacedNewNode();
+	SelectNode->AllocateDefaultPins();
+	Fixture.Graph->AddNode(SelectNode, false, false);
+	UEdGraphPin* SelectInput = nullptr;
+	UEdGraphPin* SelectOutput = nullptr;
+	for (UEdGraphPin* Pin : SelectNode->Pins)
+	{
+		if (!Pin) continue;
+		if (!SelectInput && Pin->Direction == EGPD_Input && Pin->PinName != TEXT("Index")) SelectInput = Pin;
+		if (!SelectOutput && Pin->Direction == EGPD_Output) SelectOutput = Pin;
+	}
+	TestNotNull(TEXT("select has a value input"), SelectInput);
+	TestNotNull(TEXT("select has a value output"), SelectOutput);
+	if (SelectInput && UnsupportedOutput) UnsupportedOutput->MakeLinkTo(SelectInput);
+	if (SelectOutput && Fixture.ReturnPin) SelectOutput->MakeLinkTo(Fixture.ReturnPin);
+
+	FBlueprintLispConverter::FExportOptions Options;
+	Options.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Fixture.Graph, Options);
+	TestFalse(TEXT("nested unrepresentable return source is a hard export failure"), Exported.bSuccess);
+	TestTrue(TEXT("nested failure names its source class"), Exported.Error.Contains(TEXT("EdGraphNode")));
+	return true;
+}
+
+BL_TEST(FunctionReturn_SelectRoundTripsLocaleIndependent)
+bool FFunctionReturn_SelectRoundTripsLocaleIndependent::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_SelectReturnSource"), false);
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	TestNotNull(TEXT("K2 schema exists"), Schema);
+	if (!Source.Graph || !Source.InputPin || !Source.ReturnPin || !Schema) return false;
+
+	UK2Node_Select* SelectNode = NewObject<UK2Node_Select>(Source.Graph);
+	SelectNode->CreateNewGuid();
+	Source.Graph->AddNode(SelectNode, false, false);
+	SelectNode->AllocateDefaultPins();
+	TestTrue(TEXT("bool input connects to select index"),
+		Schema->TryCreateConnection(Source.InputPin, SelectNode->GetIndexPin()));
+
+	TArray<UEdGraphPin*> OptionPins;
+	SelectNode->GetOptionPins(OptionPins);
+	TestEqual(TEXT("bool select has two options"), OptionPins.Num(), 2);
+	if (OptionPins.Num() == 2)
+	{
+		OptionPins[0]->DefaultValue = TEXT("false");
+		OptionPins[1]->DefaultValue = TEXT("true");
+	}
+	TestTrue(TEXT("select output connects to return"),
+		Schema->TryCreateConnection(SelectNode->GetReturnValuePin(), Source.ReturnPin));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("select function exports"), Exported.bSuccess);
+	TestTrue(TEXT("select uses locale-independent DSL form"), Exported.LispCode.Contains(TEXT("(select :index")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_SelectReturnDestination"), false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("select function imports"), Imported.bSuccess);
+
+	int32 SelectCount = 0;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		SelectCount += Node && Node->IsA<UK2Node_Select>() ? 1 : 0;
+	}
+	TestEqual(TEXT("import recreates one select node"), SelectCount, 1);
+
+	const FBlueprintLispResult ReExported = FBlueprintLispConverter::ExportGraph(Destination.Graph, ExportOptions);
+	TestTrue(TEXT("imported select re-exports"), ReExported.bSuccess);
+	TestTrue(TEXT("re-export retains locale-independent select form"), ReExported.LispCode.Contains(TEXT("(select :index")));
+	return true;
+}
+
+BL_TEST(FunctionMetadata_ThreadSafeRoundTrips)
+bool FFunctionMetadata_ThreadSafeRoundTrips::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_ThreadSafeSource"), true);
+	TestNotNull(TEXT("source function entry exists"), Source.Entry);
+	if (!Source.Entry || !Source.Graph) return false;
+	Source.Entry->MetaData.bThreadSafe = true;
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("thread-safe function exports"), Exported.bSuccess);
+	TestTrue(TEXT("thread-safe metadata is explicit in DSL"), Exported.LispCode.Contains(TEXT(":thread-safe true")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_ThreadSafeDestination"), false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("thread-safe function imports"), Imported.bSuccess);
+	TestTrue(TEXT("function entry restores thread-safe metadata"), Destination.Entry && Destination.Entry->MetaData.bThreadSafe);
+	return true;
+}
+
+BL_TEST(FunctionReturn_EnumSelectPreservesResultType)
+bool FFunctionReturn_EnumSelectPreservesResultType::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_EnumSelectSource"), false);
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	UEnum* MovementModeEnum = StaticEnum<EMovementMode>();
+	TestNotNull(TEXT("movement mode enum exists"), MovementModeEnum);
+	if (!Source.Graph || !Source.InputPin || !Source.ReturnPin || !Schema || !MovementModeEnum) return false;
+
+	FEdGraphPinType EnumType;
+	EnumType.PinCategory = UEdGraphSchema_K2::PC_Byte;
+	EnumType.PinSubCategoryObject = MovementModeEnum;
+	Source.Result->RemoveUserDefinedPinByName(TEXT("ReturnValue"));
+	Source.ReturnPin = Source.Result->CreateUserDefinedPin(TEXT("ReturnValue"), EnumType, EGPD_Input, false);
+	TestNotNull(TEXT("enum function return pin is created"), Source.ReturnPin);
+	if (!Source.ReturnPin) return false;
+
+	UK2Node_Select* SelectNode = NewObject<UK2Node_Select>(Source.Graph);
+	SelectNode->CreateNewGuid();
+	Source.Graph->AddNode(SelectNode, false, false);
+	SelectNode->AllocateDefaultPins();
+	TestTrue(TEXT("bool drives enum select index"), Schema->TryCreateConnection(Source.InputPin, SelectNode->GetIndexPin()));
+	UEdGraphPin* SelectReturn = SelectNode->GetReturnValuePin();
+	SelectReturn->PinType = EnumType;
+	SelectNode->ChangePinType(SelectReturn);
+
+	TArray<UEdGraphPin*> OptionPins;
+	SelectNode->GetOptionPins(OptionPins);
+	TestEqual(TEXT("enum select has two options"), OptionPins.Num(), 2);
+	if (OptionPins.Num() != 2) return false;
+	OptionPins[0]->DefaultValue = TEXT("MOVE_Walking");
+	OptionPins[1]->DefaultValue = TEXT("MOVE_Falling");
+	TestTrue(TEXT("enum select output connects to return"),
+		Schema->TryCreateConnection(SelectNode->GetReturnValuePin(), Source.ReturnPin));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("enum select exports"), Exported.bSuccess);
+	TestTrue(TEXT("enum select DSL preserves the result type object"),
+		Exported.LispCode.Contains(TEXT(":result-type-object \"/Script/Engine.EMovementMode\"")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_EnumSelectDestination"), false);
+	Destination.Result->RemoveUserDefinedPinByName(TEXT("ReturnValue"));
+	Destination.ReturnPin = Destination.Result->CreateUserDefinedPin(TEXT("ReturnValue"), EnumType, EGPD_Input, false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	if (!Imported.bSuccess) AddError(TEXT("enum select import: ") + Imported.Error);
+	TestTrue(TEXT("enum select imports"), Imported.bSuccess);
+
+	UK2Node_Select* ImportedSelect = nullptr;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		ImportedSelect = Cast<UK2Node_Select>(Node);
+		if (ImportedSelect) break;
+	}
+	TestNotNull(TEXT("enum select node is restored"), ImportedSelect);
+	if (!ImportedSelect) return false;
+	TestTrue(TEXT("enum select return keeps UEnum"),
+		ImportedSelect->GetReturnValuePin()->PinType.PinSubCategoryObject.Get() == MovementModeEnum);
+	ImportedSelect->GetOptionPins(OptionPins);
+	TestTrue(TEXT("enum select options keep UEnum"), OptionPins.Num() == 2
+		&& OptionPins[0]->PinType.PinSubCategoryObject == MovementModeEnum
+		&& OptionPins[1]->PinType.PinSubCategoryObject == MovementModeEnum);
+	return true;
+}
+
+BL_TEST(FunctionReturn_ExecKnotIsTransparent)
+bool FFunctionReturn_ExecKnotIsTransparent::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_ExecKnotSource"), true);
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	if (!Source.Graph || !Source.Entry || !Source.Result || !Schema) return false;
+
+	UEdGraphPin* EntryThen = FindPin(Source.Entry, UEdGraphSchema_K2::PN_Then, EGPD_Output);
+	UEdGraphPin* ResultExec = FindPin(Source.Result, UEdGraphSchema_K2::PN_Execute, EGPD_Input);
+	TestNotNull(TEXT("entry exec pin exists"), EntryThen);
+	TestNotNull(TEXT("result exec pin exists"), ResultExec);
+	if (!EntryThen || !ResultExec) return false;
+	EntryThen->BreakAllPinLinks();
+
+	UK2Node_Knot* Knot = NewObject<UK2Node_Knot>(Source.Graph);
+	Knot->CreateNewGuid();
+	Source.Graph->AddNode(Knot, false, false);
+	Knot->AllocateDefaultPins();
+	Knot->GetInputPin()->PinType.PinCategory = UEdGraphSchema_K2::PC_Exec;
+	Knot->GetOutputPin()->PinType.PinCategory = UEdGraphSchema_K2::PC_Exec;
+	TestTrue(TEXT("entry connects to exec knot"), Schema->TryCreateConnection(EntryThen, Knot->GetInputPin()));
+	TestTrue(TEXT("exec knot connects to result"), Schema->TryCreateConnection(Knot->GetOutputPin(), ResultExec));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("function with exec knot exports"), Exported.bSuccess);
+	TestFalse(TEXT("exec knot class is absent"), Exported.LispCode.Contains(TEXT("K2Node_Knot")));
+	TestFalse(TEXT("localized reroute title is absent"), Exported.LispCode.Contains(TEXT("变更路线节点")));
+	TestTrue(TEXT("downstream return remains present"), Exported.LispCode.Contains(TEXT("(return ")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_ExecKnotDestination"), false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("transparent exec knot function imports"), Imported.bSuccess);
+	return true;
+}
+
+BL_TEST(FunctionReturn_CollapsedPureGraphRoundTrips)
+bool FFunctionReturn_CollapsedPureGraphRoundTrips::RunTest(const FString& Parameters)
+{
+	using namespace BlueprintLispFunctionReturnTest;
+	FFixture Source = MakeFixture(TEXT("BP_BL_CollapsedReturnSource"), false);
+	const UEdGraphSchema_K2* Schema = GetDefault<UEdGraphSchema_K2>();
+	TestNotNull(TEXT("K2 schema exists"), Schema);
+	if (!Source.Graph || !Source.InputPin || !Source.ReturnPin || !Schema) return false;
+
+	UK2Node_Composite* Composite = NewObject<UK2Node_Composite>(Source.Graph);
+	Composite->CreateNewGuid();
+	Source.Graph->AddNode(Composite, false, false);
+	Composite->PostPlacedNewNode();
+	Composite->AllocateDefaultPins();
+	UK2Node_Tunnel* EntryTunnel = Composite->GetEntryNode();
+	UK2Node_Tunnel* ExitTunnel = Composite->GetExitNode();
+
+	FEdGraphPinType BoolType;
+	BoolType.PinCategory = UEdGraphSchema_K2::PC_Boolean;
+	EntryTunnel->CreateUserDefinedPin(TEXT("Input"), BoolType, EGPD_Output, false);
+	ExitTunnel->CreateUserDefinedPin(TEXT("Result"), BoolType, EGPD_Input, false);
+	Composite->ReconstructNode();
+
+	UFunction* NotFunction = UKismetMathLibrary::StaticClass()->FindFunctionByName(TEXT("Not_PreBool"));
+	TestNotNull(TEXT("boolean not function exists"), NotFunction);
+	if (!NotFunction) return false;
+	UK2Node_CallFunction* NotNode = NewObject<UK2Node_CallFunction>(Composite->BoundGraph);
+	NotNode->SetFromFunction(NotFunction);
+	NotNode->CreateNewGuid();
+	Composite->BoundGraph->AddNode(NotNode, false, false);
+	NotNode->AllocateDefaultPins();
+
+	UEdGraphPin* InnerInput = FindPin(EntryTunnel, TEXT("Input"), EGPD_Output);
+	UEdGraphPin* NotInput = FindPin(NotNode, TEXT("A"), EGPD_Input);
+	UEdGraphPin* NotOutput = FindPin(NotNode, TEXT("ReturnValue"), EGPD_Output);
+	UEdGraphPin* InnerResult = FindPin(ExitTunnel, TEXT("Result"), EGPD_Input);
+	UEdGraphPin* OuterInput = FindPin(Composite, TEXT("Input"), EGPD_Input);
+	UEdGraphPin* OuterResult = FindPin(Composite, TEXT("Result"), EGPD_Output);
+	TestTrue(TEXT("entry drives inner expression"), InnerInput && NotInput && Schema->TryCreateConnection(InnerInput, NotInput));
+	TestTrue(TEXT("inner expression drives exit"), NotOutput && InnerResult && Schema->TryCreateConnection(NotOutput, InnerResult));
+	TestTrue(TEXT("function input drives collapsed graph"), OuterInput && Schema->TryCreateConnection(Source.InputPin, OuterInput));
+	TestTrue(TEXT("collapsed graph drives function result"), OuterResult && Schema->TryCreateConnection(OuterResult, Source.ReturnPin));
+
+	FBlueprintLispConverter::FExportOptions ExportOptions;
+	ExportOptions.bPrettyPrint = false;
+	const FBlueprintLispResult Exported = FBlueprintLispConverter::ExportGraph(Source.Graph, ExportOptions);
+	TestTrue(TEXT("collapsed pure graph exports"), Exported.bSuccess);
+	TestTrue(TEXT("collapsed graph has an explicit DSL form"), Exported.LispCode.Contains(TEXT("(collapsed-graph ")));
+	TestTrue(TEXT("collapsed graph preserves its inner expression"), Exported.LispCode.Contains(TEXT("Not_PreBool")));
+	TestFalse(TEXT("opaque composite class symbol is absent"), Exported.LispCode.Contains(TEXT("K2Node_Composite")));
+
+	FFixture Destination = MakeFixture(TEXT("BP_BL_CollapsedReturnDestination"), false);
+	FBlueprintLispConverter::FImportOptions ImportOptions;
+	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
+	ImportOptions.bAutoLayout = false;
+	ImportOptions.bCompile = false;
+	const FBlueprintLispResult Imported = FBlueprintLispConverter::ImportGraph(Destination.Graph, Exported.LispCode, ImportOptions);
+	TestTrue(TEXT("collapsed graph imports"), Imported.bSuccess);
+
+	UK2Node_Composite* ImportedComposite = nullptr;
+	for (UEdGraphNode* Node : Destination.Graph->Nodes)
+	{
+		if (UK2Node_Composite* Candidate = Cast<UK2Node_Composite>(Node))
+		{
+			ImportedComposite = Candidate;
+			break;
+		}
+	}
+	TestNotNull(TEXT("import recreates UK2Node_Composite"), ImportedComposite);
+	TestTrue(TEXT("import recreates the bound graph"), ImportedComposite && ImportedComposite->BoundGraph != nullptr);
+
+	const FBlueprintLispResult ReExported = FBlueprintLispConverter::ExportGraph(Destination.Graph, ExportOptions);
+	TestTrue(TEXT("imported collapsed graph re-exports"), ReExported.bSuccess);
+	TestTrue(TEXT("re-export preserves collapsed graph semantics"),
+		ReExported.LispCode.Contains(TEXT("(collapsed-graph ")) && ReExported.LispCode.Contains(TEXT("Not_PreBool")));
+	return true;
 }
 
 BL_TEST(Lifecycle_PostNodeChanges_DeliveredWithAutoLayoutBehavior)

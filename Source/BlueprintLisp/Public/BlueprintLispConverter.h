@@ -23,6 +23,7 @@
 
 class UBlueprint;
 class UEdGraph;
+class UEdGraphPin;
 
 // ----------------------------------------------------------------------------------
 // Result type
@@ -105,6 +106,11 @@ public:
 		UEdGraph*             Graph,
 		const FExportOptions& Options = FExportOptions());
 
+	/** Export the pure expression feeding an input pin as a standalone Lisp expression. */
+	static FBlueprintLispResult ExportPureExpression(
+		UEdGraphPin*          InputPin,
+		const FExportOptions& Options = FExportOptions());
+
 	/** Export a Blueprint loaded from the given asset path */
 	static FBlueprintLispResult ExportByPath(
 		const FString&        BlueprintPath,
@@ -128,6 +134,7 @@ public:
 		bool bAutoLayout = true;                            // Run auto-layout after import
 		bool bCompile = true;                               // Compile Blueprint after import
 		bool bFailOnUnsupportedForm = true;                 // Abort before mutating graphs on known unsupported forms
+		bool bSignatureOnly = false;                        // Update a function signature/locals without importing its body
 	};
 
 	/**
@@ -155,6 +162,12 @@ public:
 		UEdGraph*             Graph,
 		const FString&        LispCode,
 		const FImportOptions& Options = FImportOptions());
+
+	/** Rebuild a standalone pure Lisp expression in Graph and connect it to TargetPin. */
+	static FBlueprintLispResult ImportPureExpression(
+		UEdGraph*             Graph,
+		UEdGraphPin*          TargetPin,
+		const FString&        LispCode);
 
 	/** Import into a Blueprint loaded from an asset path */
 	static FBlueprintLispResult ImportByPath(
