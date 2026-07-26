@@ -15,13 +15,17 @@ pin. When the selected output has a parent pin, export will continue through the
 existing generic function-call path. That path records the parent output name and
 type, then wraps the call in `break-struct` for the selected child field.
 
+Function calls will omit `:out-pin` when the selected output is the conventional
+`ReturnValue` pin. The importer already treats an omitted `:out-pin` as
+`ReturnValue`. Calls selecting any other output will continue to serialize
+`:out-pin`, preserving unambiguous reconstruction for multi-output functions.
+
 This preserves the existing DSL contract for split outputs:
 
 ```lisp
 (break-struct
   :struct Transform
   :value (MakeTransform
-    :out-pin "ReturnValue"
     :result-type-object "/Script/CoreUObject.Transform"
     ...)
   :field Rotation)
@@ -32,14 +36,17 @@ does not alter their current representation.
 
 ## Scope
 
-The implementation is limited to the native-make selection condition in
-`ConvertPureExpressionToLisp`. It does not change the importer, DSL syntax, test
-contract, or handling of explicit `UK2Node_MakeStruct` nodes.
+The implementation is limited to the native-make selection condition and the
+default-output metadata emission in `ConvertPureExpressionToLisp`. It does not
+change the importer, DSL syntax, or handling of explicit `UK2Node_MakeStruct`
+nodes. The test contract will explicitly require omission for `ReturnValue`.
 
 ## Verification
 
 1. Preserve the existing failing regression test
-   `BlueprintLisp.FunctionCall_SplitStructOutputPreservesParentType` as the RED case.
+   `BlueprintLisp.FunctionCall_SplitStructOutputPreservesParentType` as the RED case,
+   extending it to reject `:out-pin "ReturnValue"` while still requiring the parent
+   result type.
 2. Build the complete `GASPEditor` target against the associated UE 5.9 source tree.
 3. Audit plugin receipts, module mappings, engine identity, and DLL freshness.
 4. Cold-start `UnrealEditor-Cmd` and rerun the focused regression test.
