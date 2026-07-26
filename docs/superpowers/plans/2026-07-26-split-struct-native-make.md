@@ -24,7 +24,13 @@ TestTrue(TEXT("call result type describes the selected parent output"),
 	Exported.LispCode.Contains(TEXT(":result-type-object \"/Script/CoreUObject.Transform\"")));
 TestFalse(TEXT("default call output omits redundant out-pin metadata"),
 	Exported.LispCode.Contains(TEXT(":out-pin \"ReturnValue\"")));
+TestTrue(TEXT("non-default call output keeps out-pin metadata"),
+	Exported.LispCode.Contains(TEXT(":out-pin \"Origin\"")));
 ```
+
+Feed `GetComponentBounds.Origin` into `MakeTransform.Location` so the same graph
+also verifies that a non-default output remains explicitly named and survives the
+round trip.
 
 - [ ] **Step 2: Build the RED test binary**
 
