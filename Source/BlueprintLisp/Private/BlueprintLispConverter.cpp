@@ -784,7 +784,9 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 			UScriptStruct* OutputStructType = StructOutputPin
 				? Cast<UScriptStruct>(StructOutputPin->PinType.PinSubCategoryObject.Get())
 				: nullptr;
-			if (OutputStructType && OutputStructType->HasMetaData(FBlueprintMetadata::MD_NativeMakeFunction))
+			if (!SourcePin->ParentPin
+				&& OutputStructType
+				&& OutputStructType->HasMetaData(FBlueprintMetadata::MD_NativeMakeFunction))
 			{
 				const FString NativeMakePath = OutputStructType->GetMetaData(FBlueprintMetadata::MD_NativeMakeFunction);
 				if (NativeMakePath.Contains(TargetFunction->GetName(), ESearchCase::IgnoreCase))
@@ -873,8 +875,11 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 			}
 		}
 		const UEdGraphPin* SelectedCallOutputPin = SourcePin->ParentPin ? SourcePin->ParentPin : SourcePin;
-		Args.Add(FLispNode::MakeKeyword(TEXT(":out-pin")));
-		Args.Add(FLispNode::MakeString(SelectedCallOutputPin->PinName.ToString()));
+		if (SelectedCallOutputPin->PinName != UEdGraphSchema_K2::PN_ReturnValue)
+		{
+			Args.Add(FLispNode::MakeKeyword(TEXT(":out-pin")));
+			Args.Add(FLispNode::MakeString(SelectedCallOutputPin->PinName.ToString()));
+		}
 		if (SelectedCallOutputPin->PinType.PinSubCategoryObject.IsValid())
 		{
 			Args.Add(FLispNode::MakeKeyword(TEXT(":result-type-object")));

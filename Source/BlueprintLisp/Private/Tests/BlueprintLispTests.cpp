@@ -486,6 +486,7 @@ bool FConverter_Validate_MultipleEvents::RunTest(const FString& Parameters)
 #include "Curves/CurveFloat.h"
 #include "Animation/AnimInstance.h"
 #include "Kismet/KismetMathLibrary.h"
+#include "Kismet/KismetSystemLibrary.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Kismet2/BlueprintEditorUtils.h"
 #include "Kismet2/KismetEditorUtilities.h"
@@ -592,6 +593,17 @@ bool FFunctionCall_SplitStructOutputPreservesParentType::RunTest(const FString& 
 	UEdGraphPin* TransformOutput = MakeTransform->GetReturnValuePin();
 	TestNotNull(TEXT("MakeTransform return pin exists"), TransformOutput);
 	if (!TransformOutput || !Schema) return false;
+
+	UK2Node_CallFunction* GetComponentBounds = NewObject<UK2Node_CallFunction>(SourceGraph);
+	GetComponentBounds->SetFromFunction(UKismetSystemLibrary::StaticClass()->FindFunctionByName(TEXT("GetComponentBounds")));
+	GetComponentBounds->CreateNewGuid();
+	SourceGraph->AddNode(GetComponentBounds, false, false);
+	GetComponentBounds->AllocateDefaultPins();
+	TestTrue(TEXT("non-default output connects to MakeTransform input"),
+		Schema->TryCreateConnection(
+			GetComponentBounds->FindPin(TEXT("Origin"), EGPD_Output),
+			MakeTransform->FindPin(TEXT("Location"), EGPD_Input)));
+
 	const_cast<UEdGraphSchema_K2*>(Schema)->SplitPin(TransformOutput, false);
 
 	UEdGraphPin* RotationChild = nullptr;
@@ -624,7 +636,11 @@ bool FFunctionCall_SplitStructOutputPreservesParentType::RunTest(const FString& 
 	TestTrue(TEXT("split struct graph exports"), Exported.bSuccess);
 	TestTrue(TEXT("split output uses explicit break-struct"), Exported.LispCode.Contains(TEXT("(break-struct :struct Transform")));
 	TestTrue(TEXT("call result type describes the selected parent output"),
-		Exported.LispCode.Contains(TEXT(":out-pin \"ReturnValue\" :result-type-object \"/Script/CoreUObject.Transform\"")));
+		Exported.LispCode.Contains(TEXT(":result-type-object \"/Script/CoreUObject.Transform\"")));
+	TestFalse(TEXT("default call output omits redundant out-pin metadata"),
+		Exported.LispCode.Contains(TEXT(":out-pin \"ReturnValue\"")));
+	TestTrue(TEXT("non-default call output keeps out-pin metadata"),
+		Exported.LispCode.Contains(TEXT(":out-pin \"Origin\"")));
 
 	UEdGraph* DestinationGraph = nullptr;
 	UK2Node_FunctionResult* DestinationResult = nullptr;
