@@ -9,6 +9,7 @@
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
 #include "BlueprintLispAST.h"
+#include "K2Node_Knot.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -17,7 +18,7 @@
 // ============================================================================
 
 // Standard test flags: runs in Editor + Commandlet context, ProductFilter
-#define BL_FLAGS (EAutomationTestFlags_ApplicationContextMask | EAutomationTestFlags::ProductFilter)
+#define BL_FLAGS (EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
 
 #define BL_TEST(Name) \
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(F##Name, "BlueprintLisp." #Name, BL_FLAGS)

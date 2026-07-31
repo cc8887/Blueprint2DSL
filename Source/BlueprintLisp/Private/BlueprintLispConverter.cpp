@@ -1023,7 +1023,12 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		TArray<FLispNodePtr> Args;
 		Args.Add(FLispNode::MakeSymbol(TEXT("anim-node-reference")));
 		Args.Add(FLispNode::MakeKeyword(TEXT(":tag")));
-		Args.Add(FLispNode::MakeString(AnimNodeReference->GetTag().ToString()));
+		FName Tag = NAME_None;
+		if (const FNameProperty* TagProperty = FindFProperty<FNameProperty>(AnimNodeReference->GetClass(), TEXT("Tag")))
+		{
+			Tag = TagProperty->GetPropertyValue_InContainer(AnimNodeReference);
+		}
+		Args.Add(FLispNode::MakeString(Tag.ToString()));
 		return ShortIds ? AppendNodeId(FLispNode::MakeList(Args), SourceNode, *ShortIds) : FLispNode::MakeList(Args);
 	}
 
@@ -1973,10 +1978,22 @@ static FLispNodePtr ConvertInputKeyToLisp(UK2Node_InputKey* Event, UEdGraph* Gra
 	return FLispNode::MakeList(EventArgs);
 }
 
+static FName GetComponentBoundEventPropertyName(const UK2Node_ComponentBoundEvent* Event)
+{
+	if (Event)
+	{
+		if (const FNameProperty* Property = FindFProperty<FNameProperty>(Event->GetClass(), TEXT("ComponentPropertyName")))
+		{
+			return Property->GetPropertyValue_InContainer(Event);
+		}
+	}
+	return NAME_None;
+}
+
 static FLispNodePtr ConvertComponentBoundEventToLisp(UK2Node_ComponentBoundEvent* Event, UEdGraph* Graph, bool bPositions,
 	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
 {
-	FString ComponentName = Event->GetComponentPropertyName().ToString();
+	FString ComponentName = GetComponentBoundEventPropertyName(Event).ToString();
 	FString DelegateName = Event->GetDocumentationExcerptName();
 	if (DelegateName.IsEmpty())
 	{
@@ -3925,7 +3942,7 @@ static FString IMP_GetComponentBoundEventDelegateName(UK2Node_ComponentBoundEven
 static bool IMP_IsCompatibleExistingComponentBoundEventNode(UK2Node_ComponentBoundEvent* EventNode, const FString& RequestedComponentName, const FString& RequestedDelegateName)
 {
 	return EventNode
-		&& EventNode->GetComponentPropertyName().ToString().Equals(RequestedComponentName, ESearchCase::IgnoreCase)
+		&& GetComponentBoundEventPropertyName(EventNode).ToString().Equals(RequestedComponentName, ESearchCase::IgnoreCase)
 		&& IMP_GetComponentBoundEventDelegateName(EventNode).Equals(RequestedDelegateName, ESearchCase::IgnoreCase);
 }
 
@@ -8194,7 +8211,10 @@ static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImp
 	if (FormName.Equals(TEXT("anim-node-reference"), ESearchCase::IgnoreCase))
 	{
 		UK2Node_AnimNodeReference* ReferenceNode = NewObject<UK2Node_AnimNodeReference>(Ctx.Graph);
-		ReferenceNode->SetTag(FName(*IMP_GetKeywordAtomValue(Expr, TEXT(":tag"))));
+		if (FNameProperty* TagProperty = FindFProperty<FNameProperty>(ReferenceNode->GetClass(), TEXT("Tag")))
+		{
+			TagProperty->SetPropertyValue_InContainer(ReferenceNode, FName(*IMP_GetKeywordAtomValue(Expr, TEXT(":tag"))));
+		}
 		ReferenceNode->NodePosX = Ctx.CurrentX;
 		ReferenceNode->NodePosY = Ctx.CurrentY;
 		Ctx.Graph->AddNode(ReferenceNode, false, false);
@@ -9038,7 +9058,10 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		}
 
 		UK2Node_SwitchEnum* SwitchNode = NewObject<UK2Node_SwitchEnum>(Ctx.Graph);
-		SwitchNode->SetEnum(TargetEnum);
+		if (FObjectProperty* EnumProperty = FindFProperty<FObjectProperty>(SwitchNode->GetClass(), TEXT("Enum")))
+		{
+			EnumProperty->SetObjectPropertyValue_InContainer(SwitchNode, TargetEnum);
+		}
 		SwitchNode->bHasDefaultPin = DefaultBody.IsValid() && !DefaultBody->IsNil();
 		SwitchNode->NodePosX = Ctx.CurrentX;
 		SwitchNode->NodePosY = Ctx.CurrentY;
