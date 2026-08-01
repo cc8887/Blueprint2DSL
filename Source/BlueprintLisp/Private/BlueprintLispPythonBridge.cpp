@@ -174,10 +174,12 @@ namespace BPLispBridge
 		{
 			return TEXT("float");
 		}
+#if ENGINE_MAJOR_VERSION >= 5
 		if (PinCategoryString == TEXT("real") || PinCategoryString == TEXT("double"))
 		{
 			return PinSubCategory == UEdGraphSchema_K2::PC_Double ? TEXT("double") : TEXT("float");
 		}
+#endif
 		if (PinCategoryString == TEXT("string"))
 		{
 			return TEXT("string");

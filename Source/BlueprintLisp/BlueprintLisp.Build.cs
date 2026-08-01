@@ -7,7 +7,8 @@ public class BlueprintLisp : ModuleRules
 	public BlueprintLisp(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-		CppStandard = CppStandardVersion.Cpp20;
+		// UE 4.27 supports C++17; the plugin does not require C++20 language features.
+		CppStandard = CppStandardVersion.Cpp17;
 
 		// Public: available to dependent modules
 		PublicDependencyModuleNames.AddRange(new string[]
@@ -28,7 +29,6 @@ public class BlueprintLisp : ModuleRules
 			"KismetCompiler",
 			"GraphEditor",
 			"EditorSubsystem",
-			"EditorFramework",
 			"AssetRegistry",
 			"AssetTools",
 			"InputCore",

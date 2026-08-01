@@ -162,7 +162,11 @@ FString FBlueprintLispMappingRegistry::DSLToBlueprintPath(const FString& DSLFile
 	IAssetRegistry& AssetRegistry = AssetRegistryModule.Get();
 
 	TArray<FAssetData> AllBPs;
+#if ENGINE_MAJOR_VERSION >= 5
 	AssetRegistry.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), AllBPs);
+#else
+	AssetRegistry.GetAssetsByClass(UBlueprint::StaticClass()->GetFName(), AllBPs);
+#endif
 
 	TArray<FString> Candidates;
 	for (const FAssetData& Asset : AllBPs)
@@ -220,7 +224,11 @@ void FBlueprintLispMappingRegistry::ScanDSLFiles()
 
 	TMap<FString, TArray<FString>> BPNameToPaths;
 	TArray<FAssetData> AllBPs;
+#if ENGINE_MAJOR_VERSION >= 5
 	AssetRegistry.GetAssetsByClass(UBlueprint::StaticClass()->GetClassPathName(), AllBPs);
+#else
+	AssetRegistry.GetAssetsByClass(UBlueprint::StaticClass()->GetFName(), AllBPs);
+#endif
 	for (const FAssetData& Asset : AllBPs)
 	{
 		FString PkgPath = Asset.PackageName.ToString();

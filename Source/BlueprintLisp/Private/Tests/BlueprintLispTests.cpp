@@ -821,7 +821,7 @@ bool FFunctionReturn_DirectParameterRoundTrips::RunTest(const FString& Parameter
 	TestFalse(TEXT("localized generic return fallback is absent"), Exported.LispCode.Contains(TEXT("返回节点")));
 
 	const FFixture Destination = MakeFixture(TEXT("BP_BL_ReturnDestination"), false);
-	TestTrue(TEXT("destination starts disconnected"), Destination.ReturnPin && Destination.ReturnPin->LinkedTo.IsEmpty());
+	TestTrue(TEXT("destination starts disconnected"), Destination.ReturnPin && Destination.ReturnPin->LinkedTo.Num() == 0);
 	FBlueprintLispConverter::FImportOptions ImportOptions;
 	ImportOptions.ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
 	ImportOptions.bAutoLayout = false;
@@ -879,8 +879,10 @@ bool FGenericCreateObject_RoundTripsExecAndResultDataflow::RunTest(const FString
 	if (EntryThen) EntryThen->BreakAllPinLinks();
 	if (ResultExecute) ResultExecute->BreakAllPinLinks();
 	TestTrue(TEXT("entry connects to create-object"), Schema && Schema->TryCreateConnection(EntryThen, CreateNode->GetExecPin()));
-	TestTrue(TEXT("create-object connects to variable set"), Schema && Schema->TryCreateConnection(CreateNode->GetThenPin(), SetNode->GetExecPin()));
-	TestTrue(TEXT("variable set connects to function result"), Schema && Schema->TryCreateConnection(SetNode->GetThenPin(), ResultExecute));
+	TestTrue(TEXT("create-object connects to variable set"), Schema && Schema->TryCreateConnection(
+		FindPin(CreateNode, UEdGraphSchema_K2::PN_Then, EGPD_Output), SetNode->GetExecPin()));
+	TestTrue(TEXT("variable set connects to function result"), Schema && Schema->TryCreateConnection(
+		FindPin(SetNode, UEdGraphSchema_K2::PN_Then, EGPD_Output), ResultExecute));
 	UEdGraphPin* SetValuePin = FindPin(SetNode, TEXT("CreatedObject"), EGPD_Input);
 	TestTrue(TEXT("created object result feeds variable set"), Schema && Schema->TryCreateConnection(CreateNode->GetResultPin(), SetValuePin));
 
@@ -1154,6 +1156,7 @@ bool FFunctionReturn_SelectRoundTripsLocaleIndependent::RunTest(const FString& P
 	return true;
 }
 
+#if ENGINE_MAJOR_VERSION >= 5
 BL_TEST(FunctionMetadata_ThreadSafeRoundTrips)
 bool FFunctionMetadata_ThreadSafeRoundTrips::RunTest(const FString& Parameters)
 {
@@ -1178,6 +1181,7 @@ bool FFunctionMetadata_ThreadSafeRoundTrips::RunTest(const FString& Parameters)
 	TestTrue(TEXT("function entry restores thread-safe metadata"), Destination.Entry && Destination.Entry->MetaData.bThreadSafe);
 	return true;
 }
+#endif
 
 BL_TEST(FunctionReturn_EnumSelectPreservesResultType)
 bool FFunctionReturn_EnumSelectPreservesResultType::RunTest(const FString& Parameters)

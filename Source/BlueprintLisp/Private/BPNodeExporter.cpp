@@ -186,7 +186,11 @@ FString FBPNodeExporter::GetPinTypeString(const FEdGraphPinType& PinType)
 		return TEXT("exec");
 	if (Category == UEdGraphSchema_K2::PC_Boolean)
 		return TEXT("bool");
-	if (Category == UEdGraphSchema_K2::PC_Float || Category == UEdGraphSchema_K2::PC_Real)
+	if (Category == UEdGraphSchema_K2::PC_Float
+#if ENGINE_MAJOR_VERSION >= 5
+		|| Category == UEdGraphSchema_K2::PC_Real
+#endif
+		)
 		return TEXT("float");
 	if (Category == UEdGraphSchema_K2::PC_Int)
 		return TEXT("int");

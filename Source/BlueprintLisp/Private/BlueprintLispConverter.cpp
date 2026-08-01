@@ -25,7 +25,9 @@
 #include "K2Node_CallFunction.h"
 #include "K2Node_CallArrayFunction.h"
 #include "K2Node_CommutativeAssociativeBinaryOperator.h"
+#if ENGINE_MAJOR_VERSION >= 5
 #include "K2Node_PromotableOperator.h"
+#endif
 #include "K2Node_Message.h"
 #include "K2Node_CallParentFunction.h"
 #include "K2Node_IfThenElse.h"
@@ -81,7 +83,9 @@
 
 #include "AnimGraphNode_TransitionResult.h"
 #include "AnimationTransitionGraph.h"
+#if ENGINE_MAJOR_VERSION >= 5
 #include "K2Node_AnimNodeReference.h"
+#endif
 #include "K2Node_AnimGetter.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogBlueprintLisp, Log, All);
@@ -97,7 +101,7 @@ static TMap<FGuid, FString> ComputeShortIds(const TArray<FGuid>& Guids)
 {
 	static const int32 Lengths[] = { 8, 12, 16, 20, 32 };
 	TMap<FGuid, FString> Result;
-	if (Guids.IsEmpty()) return Result;
+	if (Guids.Num() == 0) return Result;
 
 	for (int32 LenIdx = 0; LenIdx < UE_ARRAY_COUNT(Lengths); LenIdx++)
 	{
@@ -238,7 +242,9 @@ static FString PinTypeToLispType(const FEdGraphPinType& PT)
 		if (Cat == TEXT("int"))    return TEXT("int");
 		if (Cat == TEXT("int64"))  return TEXT("int64");
 		if (Cat == TEXT("float"))  return TEXT("float");
+#if ENGINE_MAJOR_VERSION >= 5
 		if (Cat == TEXT("real") || Cat == TEXT("double")) return PinSubCategory == UEdGraphSchema_K2::PC_Double ? TEXT("double") : TEXT("float");
+#endif
 		if (Cat == TEXT("string")) return TEXT("string");
 		if (Cat == TEXT("name"))   return TEXT("name");
 		if (Cat == TEXT("text"))   return TEXT("text");
@@ -533,8 +539,11 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 			}
 			else if (ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Int
 				|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Float
+#if ENGINE_MAJOR_VERSION >= 5
 				|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Double
-				|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Real)
+				|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Real
+#endif
+				)
 			{
 				DefaultValue = TEXT("0");
 			}
@@ -545,8 +554,11 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 			return FLispNode::MakeSymbol(DefaultValue.ToLower() == TEXT("true") ? TEXT("true") : TEXT("false"));
 		if (ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Int
 			|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Float
+#if ENGINE_MAJOR_VERSION >= 5
 			|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Double
-			|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Real)
+			|| ValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Real
+#endif
+			)
 		{
 			if (LexTryParseString(Num, *DefaultValue))
 				return FLispNode::MakeNumber(Num);
@@ -855,11 +867,13 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 			Args.Add(FLispNode::MakeKeyword(TEXT(":call-kind")));
 			Args.Add(FLispNode::MakeString(TEXT("message")));
 		}
+#if ENGINE_MAJOR_VERSION >= 5
 		else if (Cast<UK2Node_PromotableOperator>(CallNode))
 		{
 			Args.Add(FLispNode::MakeKeyword(TEXT(":call-kind")));
 			Args.Add(FLispNode::MakeString(TEXT("promotable-operator")));
 		}
+#endif
 		else if (Cast<UK2Node_AnimGetter>(CallNode))
 		{
 			Args.Add(FLispNode::MakeKeyword(TEXT(":call-kind")));
@@ -1018,6 +1032,7 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		return ShortIds ? AppendNodeId(FLispNode::MakeList(Args), SourceNode, *ShortIds) : FLispNode::MakeList(Args);
 	}
 
+#if ENGINE_MAJOR_VERSION >= 5
 	if (UK2Node_AnimNodeReference* AnimNodeReference = Cast<UK2Node_AnimNodeReference>(SourceNode))
 	{
 		TArray<FLispNodePtr> Args;
@@ -1031,6 +1046,7 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 		Args.Add(FLispNode::MakeString(Tag.ToString()));
 		return ShortIds ? AppendNodeId(FLispNode::MakeList(Args), SourceNode, *ShortIds) : FLispNode::MakeList(Args);
 	}
+#endif
 
 	if (UK2Node_GetEnumeratorName* EnumNameNode = Cast<UK2Node_GetEnumeratorName>(SourceNode))
 	{
@@ -1208,7 +1224,7 @@ static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<
 		{
 			if (!Pin || Pin->Direction != EGPD_Input
 				|| Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec
-				|| Pin->ParentPin || (Pin->bHidden && Pin->SubPins.IsEmpty())
+				|| Pin->ParentPin || (Pin->bHidden && Pin->SubPins.Num() == 0)
 				|| Pin->PinName == UEdGraphSchema_K2::PN_Execute)
 			{
 				continue;
@@ -1774,7 +1790,7 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 		}
 
 		// Skip entry tunnel nodes (they are handled as macro entry points, not as chain nodes)
-		// But MacroInstance (which inherits Tunnel) should NOT be skipped — it's a call node.
+		// But MacroInstance (which inherits Tunnel) should NOT be skipped 鈥?it's a call node.
 		if (UK2Node_Tunnel* TE = Cast<UK2Node_Tunnel>(NextNode))
 		{
 			if (TE->DrawNodeAsEntry() && !Cast<UK2Node_MacroInstance>(NextNode)) break;
@@ -1789,7 +1805,7 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 
 		// Exit tunnel terminates the chain (macro exit point)
 
-		// But MacroInstance is NOT an exit tunnel — it continues the exec chain.
+		// But MacroInstance is NOT an exit tunnel 鈥?it continues the exec chain.
 		if (UK2Node_Tunnel* TE = Cast<UK2Node_Tunnel>(NextNode))
 		{
 			if (!TE->DrawNodeAsEntry() && !Cast<UK2Node_MacroInstance>(NextNode)) break;
@@ -2119,7 +2135,11 @@ static FLispNodePtr ConvertFunctionEntryToLisp(UK2Node_FunctionEntry* FuncEntry,
 	FuncArgs.Add(FLispNode::MakeSymbol(TEXT("function")));
 	FuncArgs.Add(EXP_MakeNameAtom(FuncName));
 	FuncArgs.Add(FLispNode::MakeKeyword(TEXT(":thread-safe")));
+#if ENGINE_MAJOR_VERSION >= 5
 	FuncArgs.Add(FLispNode::MakeSymbol(FuncEntry->MetaData.bThreadSafe ? TEXT("true") : TEXT("false")));
+#else
+	FuncArgs.Add(FLispNode::MakeSymbol(TEXT("false")));
+#endif
 	FuncArgs.Add(FLispNode::MakeKeyword(TEXT(":pure")));
 	FuncArgs.Add(FLispNode::MakeSymbol((FuncEntry->GetFunctionFlags() & FUNC_BlueprintPure) != 0
 		? TEXT("true") : TEXT("false")));
@@ -2259,7 +2279,7 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 	{
 		if (UK2Node_Tunnel* ExitTunnel = Cast<UK2Node_Tunnel>(N))
 		{
-			// Skip MacroInstance nodes — they are NOT exit tunnels
+			// Skip MacroInstance nodes 鈥?they are NOT exit tunnels
 			if (Cast<UK2Node_MacroInstance>(N)) continue;
 			if (!ExitTunnel->DrawNodeAsEntry())
 			{
@@ -2365,23 +2385,23 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 // Adapted from ECABridge/ECABlueprintLispCommands.cpp (Epic Games, Experimental)
 // ============================================================================
 
-/** Context for Lisp → Blueprint conversion (mirrors ECABridge's FLispToBPContext) */
+/** Context for Lisp 鈫?Blueprint conversion (mirrors ECABridge's FLispToBPContext) */
 struct FBPImportContext
 {
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph*   Graph     = nullptr;
 	FBlueprintLispConverter::EImportMode ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
 
-	TMap<FString, UEdGraphNode*> TempIdToNode;     // tempId / NodeGuid → node
+	TMap<FString, UEdGraphNode*> TempIdToNode;     // tempId / NodeGuid 鈫?node
 	TSet<FGuid> ConsumedRootEventGuids;
 	TArray<UEdGraphNode*> ReusableBodyNodes;
 	TMap<FString, UEdGraphNode*> ReusableBodyStableIdToNode;
 	TSet<FGuid> ConsumedReusableBodyGuids;
 	TSet<FGuid> ConsumedFunctionResultGuids;
 
-	TMap<FString, FString>       VariableToNodeId; // var name → node GUID or _literal_ key
+	TMap<FString, FString>       VariableToNodeId; // var name 鈫?node GUID or _literal_ key
 
-	TMap<FString, FString>       VariableToPin;    // var name → pin name
+	TMap<FString, FString>       VariableToPin;    // var name 鈫?pin name
 	TMap<FString, UFunction*>    FunctionCache;    // deterministic function lookup cache
 
 	TArray<FString> Errors;
@@ -3268,8 +3288,13 @@ static bool IMP_IsCompatibleExistingCallNode(UK2Node_CallFunction* CallNode, con
 	}
 
 	const bool bExistingUsesSelfMemberReference = !CallNode->FunctionReference.GetMemberName().IsNone() && CallNode->GetTargetFunction() == nullptr;
+#if ENGINE_MAJOR_VERSION >= 5
+	const bool bExistingIsPromotableOperator = Cast<UK2Node_PromotableOperator>(CallNode) != nullptr;
+#else
+	const bool bExistingIsPromotableOperator = false;
+#endif
 	return bExistingUsesSelfMemberReference == bUseSelfMemberReference
-		&& (Cast<UK2Node_PromotableOperator>(CallNode) != nullptr) == bRequestedPromotableOperator
+		&& bExistingIsPromotableOperator == bRequestedPromotableOperator
 		&& (Cast<UK2Node_AnimGetter>(CallNode) != nullptr) == bRequestedAnimGetter;
 }
 
@@ -3304,7 +3329,11 @@ static UK2Node_CallFunction* IMP_CreateOrReuseCallFunctionNode(const FLispNodePt
 		}
 		if (DeclaredOutputPin)
 		{
+#if ENGINE_MAJOR_VERSION >= 5
 			DeclaredOutputPin->PinType.PinSubCategoryObject = TypeObject;
+#else
+			DeclaredOutputPin->PinType.PinSubCategoryObject = TWeakObjectPtr<UObject>(TypeObject);
+#endif
 		}
 		if (RequestedFunctionName.Equals(TEXT("GetComponentByClass"), ESearchCase::IgnoreCase))
 		{
@@ -3331,17 +3360,33 @@ static UK2Node_CallFunction* IMP_CreateOrReuseCallFunctionNode(const FLispNodePt
 		}
 	}
 
-	UK2Node_CallFunction* CallNode = CallKind.Equals(TEXT("message"), ESearchCase::IgnoreCase)
-		? NewObject<UK2Node_Message>(Ctx.Graph)
-		: bRequestedAnimGetter
-			? NewObject<UK2Node_AnimGetter>(Ctx.Graph)
-		: bRequestedPromotableOperator
-			? NewObject<UK2Node_PromotableOperator>(Ctx.Graph)
-		: Function && Function->HasMetaData(FBlueprintMetadata::MD_CommutativeAssociativeBinaryOperator)
-			? NewObject<UK2Node_CommutativeAssociativeBinaryOperator>(Ctx.Graph)
-			: Function && Function->HasMetaData(FBlueprintMetadata::MD_ArrayParam)
-				? NewObject<UK2Node_CallArrayFunction>(Ctx.Graph)
-			: NewObject<UK2Node_CallFunction>(Ctx.Graph);
+	UK2Node_CallFunction* CallNode = nullptr;
+	if (CallKind.Equals(TEXT("message"), ESearchCase::IgnoreCase))
+	{
+		CallNode = NewObject<UK2Node_Message>(Ctx.Graph);
+	}
+	else if (bRequestedAnimGetter)
+	{
+		CallNode = NewObject<UK2Node_AnimGetter>(Ctx.Graph);
+	}
+#if ENGINE_MAJOR_VERSION >= 5
+	else if (bRequestedPromotableOperator)
+	{
+		CallNode = NewObject<UK2Node_PromotableOperator>(Ctx.Graph);
+	}
+#endif
+	else if (Function && Function->HasMetaData(FBlueprintMetadata::MD_CommutativeAssociativeBinaryOperator))
+	{
+		CallNode = NewObject<UK2Node_CommutativeAssociativeBinaryOperator>(Ctx.Graph);
+	}
+	else if (Function && Function->HasMetaData(FBlueprintMetadata::MD_ArrayParam))
+	{
+		CallNode = NewObject<UK2Node_CallArrayFunction>(Ctx.Graph);
+	}
+	else
+	{
+		CallNode = NewObject<UK2Node_CallFunction>(Ctx.Graph);
+	}
 	if (bUseSelfMemberReference)
 	{
 		CallNode->FunctionReference.SetSelfMember(FName(*RequestedFunctionName));
@@ -4701,7 +4746,7 @@ static void IMP_UpdateCurrentExecPin(UEdGraphNode* Node, UEdGraphPin* OutExecPin
 	}
 }
 
-// Connect two pins (source→target) with schema validation.
+// Connect two pins (source鈫抰arget) with schema validation.
 
 static bool IMP_Connect(UEdGraphPin* Src, UEdGraphPin* Dst, FBPImportContext& Ctx)
 {
@@ -4782,15 +4827,25 @@ static bool IMP_ApplyLispTypeToPin(UEdGraphPin* Pin, const FString& TypeName)
 	const FString Normalized = TypeName.TrimStartAndEnd().ToLower();
 	if (Normalized == TEXT("float"))
 	{
+#if ENGINE_MAJOR_VERSION >= 5
 		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
 		Pin->PinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+#else
+		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Float;
+		Pin->PinType.PinSubCategory = NAME_None;
+#endif
 		Pin->PinType.PinSubCategoryObject = nullptr;
 		return true;
 	}
 	if (Normalized == TEXT("double") || Normalized == TEXT("real"))
 	{
+#if ENGINE_MAJOR_VERSION >= 5
 		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Real;
 		Pin->PinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+#else
+		Pin->PinType.PinCategory = UEdGraphSchema_K2::PC_Float;
+		Pin->PinType.PinSubCategory = NAME_None;
+#endif
 		Pin->PinType.PinSubCategoryObject = nullptr;
 		return true;
 	}
@@ -5058,7 +5113,7 @@ static UEdGraphPin* IMP_FindImportedStableOutputPin(const FLispNodePtr& Form, UE
 					|| RootPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) continue;
 				const FString RootNormalized = IMP_NormalizePinLookupName(RootPin->PinName.ToString());
 				if (!PreferredNormalized.StartsWith(RootNormalized) || PreferredNormalized == RootNormalized) continue;
-				if (RootPin->SubPins.IsEmpty()) K2Schema->SplitPin(RootPin, false);
+				if (RootPin->SubPins.Num() == 0) K2Schema->SplitPin(RootPin, false);
 				const FString FieldSuffix = PreferredNormalized.Mid(RootNormalized.Len());
 				for (UEdGraphPin* SubPin : RootPin->SubPins)
 				{
@@ -5289,7 +5344,7 @@ static UEdGraphPin* IMP_TryBuildBreakStructOutputPin(const FLispNodePtr& Expr, U
 			if (StructValuePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Struct
 				&& StructValuePin->PinType.PinSubCategoryObject == StructType)
 			{
-				if (StructValuePin->SubPins.IsEmpty())
+				if (StructValuePin->SubPins.Num() == 0)
 				{
 					if (const UEdGraphSchema_K2* K2Schema = Cast<UEdGraphSchema_K2>(Ctx.Graph->GetSchema()))
 					{
@@ -5375,7 +5430,7 @@ static UEdGraphPin* IMP_TryBuildBreakStructOutputPin(const FLispNodePtr& Expr, U
 					|| RootPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Struct) continue;
 				const FString RootNormalized = IMP_NormalizePinLookupName(RootPin->PinName.ToString());
 				if (!PreferredNormalized.StartsWith(RootNormalized) || PreferredNormalized == RootNormalized) continue;
-				if (RootPin->SubPins.IsEmpty()) K2Schema->SplitPin(RootPin, false);
+				if (RootPin->SubPins.Num() == 0) K2Schema->SplitPin(RootPin, false);
 				const FString FieldSuffix = PreferredNormalized.Mid(RootNormalized.Len());
 				for (UEdGraphPin* SubPin : RootPin->SubPins)
 				{
@@ -6562,14 +6617,22 @@ static bool IMP_BuildNonContainerPinTypeFromLispType(const FString& TypeName, FE
 
 	if (Lower == TEXT("float"))
 	{
+#if ENGINE_MAJOR_VERSION >= 5
 		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
 		OutPinType.PinSubCategory = UEdGraphSchema_K2::PC_Float;
+#else
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Float;
+#endif
 		return true;
 	}
 	if (Lower == TEXT("double") || Lower == TEXT("real"))
 	{
+#if ENGINE_MAJOR_VERSION >= 5
 		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Real;
 		OutPinType.PinSubCategory = UEdGraphSchema_K2::PC_Double;
+#else
+		OutPinType.PinCategory = UEdGraphSchema_K2::PC_Float;
+#endif
 		return true;
 	}
 	if (Lower == TEXT("vector"))
@@ -6707,11 +6770,21 @@ static bool IMP_BuildPinTypeFromLispType(const FString& TypeName, FEdGraphPinTyp
 
 static bool IMP_ArePinTypesEquivalent(const FEdGraphPinType& A, const FEdGraphPinType& B)
 {
+#if ENGINE_MAJOR_VERSION >= 5
 	if (const UEdGraphSchema_K2* K2Schema = GetDefault<UEdGraphSchema_K2>())
 	{
 		return K2Schema->ArePinTypesEquivalent(A, B);
 	}
 	return false;
+#else
+	return A.PinCategory == B.PinCategory
+		&& A.PinSubCategory == B.PinSubCategory
+		&& A.PinSubCategoryObject == B.PinSubCategoryObject
+		&& A.ContainerType == B.ContainerType
+		&& A.PinValueType.TerminalCategory == B.PinValueType.TerminalCategory
+		&& A.PinValueType.TerminalSubCategory == B.PinValueType.TerminalSubCategory
+		&& A.PinValueType.TerminalSubCategoryObject == B.PinValueType.TerminalSubCategoryObject;
+#endif
 }
 
 static bool IMP_TryGetExistingBlueprintVariableType(UBlueprint* Blueprint, const FName& VarName, FEdGraphPinType& OutPinType)
@@ -6805,7 +6878,11 @@ static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarNa
 	{
 		if (PinCategory == UEdGraphSchema_K2::PC_Int || PinCategory == UEdGraphSchema_K2::PC_Int64 || PinCategory == UEdGraphSchema_K2::PC_Byte)
 		{
+#if ENGINE_MAJOR_VERSION >= 5
 			const int64 RoundedValue = FMath::RoundToInt64(Expr->NumberValue);
+#else
+			const int64 RoundedValue = static_cast<int64>(FMath::RoundToDouble(Expr->NumberValue));
+#endif
 			if (!FMath::IsNearlyEqual(Expr->NumberValue, static_cast<double>(RoundedValue)))
 			{
 				Ctx.Errors.Add(FString::Printf(TEXT("Import var form failed: :default for '%s' must be an integer literal"), *VarName));
@@ -6814,7 +6891,11 @@ static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarNa
 			OutDefaultValue = LexToString(RoundedValue);
 			return true;
 		}
-		if (PinCategory == UEdGraphSchema_K2::PC_Real || PinCategory == UEdGraphSchema_K2::PC_Float || PinCategory == UEdGraphSchema_K2::PC_Double)
+		if (PinCategory == UEdGraphSchema_K2::PC_Float
+#if ENGINE_MAJOR_VERSION >= 5
+			|| PinCategory == UEdGraphSchema_K2::PC_Real || PinCategory == UEdGraphSchema_K2::PC_Double
+#endif
+			)
 		{
 			OutDefaultValue = FString::SanitizeFloat(Expr->NumberValue);
 			return true;
@@ -7151,8 +7232,10 @@ static void IMP_EnsureFunctionEntryParamsFromFunctionForm(UK2Node_FunctionEntry*
 		}
 	}
 
+#if ENGINE_MAJOR_VERSION >= 5
 	ExistingEntry->MetaData.bThreadSafe = Form->HasKeyword(TEXT(":thread-safe"))
 		&& IMP_IsTruthy(Form->GetKeywordArg(TEXT(":thread-safe")));
+#endif
 
 	const bool bPure = Form->HasKeyword(TEXT(":pure"))
 		&& IMP_IsTruthy(Form->GetKeywordArg(TEXT(":pure")));
@@ -7831,7 +7914,7 @@ static void IMP_ConvertActorBoundEventForm(const FLispNodePtr& Form, FBPImportCo
 	Ctx.NewRow();
 }
 
-// --- Resolve pure expression → output pin ---
+// --- Resolve pure expression 鈫?output pin ---
 static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImportContext& Ctx)
 {
 	if (!Expr.IsValid() || Expr->IsNil()) return nullptr;
@@ -8082,7 +8165,7 @@ static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImp
 			(bInput ? Inputs : Outputs).Add(MoveTemp(Spec));
 		}
 
-		if (Outputs.IsEmpty())
+		if (Outputs.Num() == 0)
 		{
 			Ctx.Errors.Add(TEXT("IMP: collapsed-graph must declare at least one :output"));
 			return nullptr;
@@ -8208,6 +8291,7 @@ static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImp
 		return OutputPin;
 	}
 
+#if ENGINE_MAJOR_VERSION >= 5
 	if (FormName.Equals(TEXT("anim-node-reference"), ESearchCase::IgnoreCase))
 	{
 		UK2Node_AnimNodeReference* ReferenceNode = NewObject<UK2Node_AnimNodeReference>(Ctx.Graph);
@@ -8225,6 +8309,7 @@ static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImp
 		Ctx.AdvancePosition();
 		return IMP_FindOutputPinByName(ReferenceNode, TEXT("Value"));
 	}
+#endif
 
 	if (FormName.Equals(TEXT("pure-cast"), ESearchCase::IgnoreCase)
 		|| FormName.Equals(TEXT("pure-cast-succeeds"), ESearchCase::IgnoreCase))
@@ -8552,7 +8637,7 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 	return ResolvedPin;
 }
 
-// --- Convert a single executable form → K2Node ---
+// --- Convert a single executable form 鈫?K2Node ---
 static UEdGraphNode* IMP_ConvertFormToNodeStable(const FLispNodePtr& Form, FBPImportContext& Ctx, UEdGraphPin*& OutExecPin)
 {
 	UEdGraphNode* Node = IMP_ConvertFormToNode(Form, Ctx, OutExecPin);
@@ -8571,7 +8656,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 
 	FString FormName = Form->GetFormName();
 
-	// (seq s1 s2 ...) — execute in order; if it carries :id, treat it as an actual UK2Node_ExecutionSequence
+	// (seq s1 s2 ...) 鈥?execute in order; if it carries :id, treat it as an actual UK2Node_ExecutionSequence
 	if (FormName.Equals(TEXT("seq"), ESearchCase::IgnoreCase))
 	{
 		TArray<FLispNodePtr> SequenceBodies;
@@ -8736,7 +8821,12 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			if (!Property) return;
 			const FString Value = IMP_GetAtomName(ValueNode);
 			void* ValuePtr = Property->ContainerPtrToValuePtr<void>(ChooserNode);
-			if (!Property->ImportText_Direct(*Value, ValuePtr, ChooserNode, PPF_None))
+#if ENGINE_MAJOR_VERSION >= 5
+			const TCHAR* ImportResult = Property->ImportText_Direct(*Value, ValuePtr, ChooserNode, PPF_None);
+#else
+			const TCHAR* ImportResult = Property->ImportText(*Value, ValuePtr, PPF_None, ChooserNode);
+#endif
+			if (!ImportResult)
 			{
 				Ctx.Errors.Add(FString::Printf(TEXT("IMP: evaluate-chooser property %s rejected value '%s'"), PropertyName, *Value));
 			}
@@ -8766,7 +8856,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 					&& InputPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Object
 					&& Ctx.Blueprint && Ctx.Blueprint->GeneratedClass)
 				{
-					InputPin->PinType.PinSubCategoryObject = Ctx.Blueprint->GeneratedClass;
+					InputPin->PinType.PinSubCategoryObject = Ctx.Blueprint->GeneratedClass.Get();
 				}
 				IMP_SetPinFromExpr(InputPin, InputValue, Ctx);
 			}
@@ -9303,7 +9393,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 
 	}
 
-	// (let var expr) — bind variable; keep exec-producing expr in the chain
+	// (let var expr) 鈥?bind variable; keep exec-producing expr in the chain
 	if (FormName.Equals(TEXT("let"), ESearchCase::IgnoreCase) && Form->Num() >= 3)
 	{
 		int32 ExprIndex = INDEX_NONE;
@@ -9601,7 +9691,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		return nullptr;
 	}
 
-	// (FuncName [self] [:pin value]...) — shorthand call
+	// (FuncName [self] [:pin value]...) 鈥?shorthand call
 	if (!FormName.IsEmpty())
 	{
 		if (UFunction* F = IMP_FindFunctionForForm(FormName, Form, Ctx))
@@ -9684,8 +9774,8 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 
 	UK2Node_Event* EventNode = nullptr;
 
-	// 当前 DSL 里只有 custom event 会显式导出 :param；若带 :param 仍去匹配 override/interface，
-	// 容易把 custom event 误建成 UK2Node_Event 并丢掉自定义参数。
+	// 褰撳墠 DSL 閲屽彧鏈?custom event 浼氭樉寮忓鍑?:param锛涜嫢甯?:param 浠嶅幓鍖归厤 override/interface锛?
+	// 瀹规槗鎶?custom event 璇缓鎴?UK2Node_Event 骞朵涪鎺夎嚜瀹氫箟鍙傛暟銆?
 	const bool bHasExplicitParams = EventForm->HasKeyword(TEXT(":param"));
 
 	// Override / interface event / custom event?
@@ -9929,7 +10019,7 @@ static UEdGraphPin* BuildPureExprNode(
 	{
 		FString Sym = Head->StringValue;
 
-		// (self.VarName) — single element list acting as member variable reference
+		// (self.VarName) 鈥?single element list acting as member variable reference
 		if (Sym.StartsWith(TEXT("self.")))
 		{
 			FString VarName = Sym.Mid(5);
@@ -10110,7 +10200,7 @@ static UEdGraphPin* BuildPureExprNode(
 			}
 
 			// Type propagation will happen when ImportGraph calls ReconstructNode on all created nodes.
-			// Do NOT call PostReconstructNode here — connections may not be finalized yet.
+			// Do NOT call PostReconstructNode here 鈥?connections may not be finalized yet.
 
 			// Return the bool output pin
 			if (UK2Node_EnumEquality* EqNode = Cast<UK2Node_EnumEquality>(CompNode))
@@ -10271,7 +10361,7 @@ FBlueprintLispResult FBlueprintLispConverter::ExportGraph(
 	// Function-graph mode: handles AnimationTransitionGraph and other pure-expression graphs
 	// that have a Result/Sink node but no Event entry node.
 	// We locate the sink node, find its bool input pin, and export the pure DAG as (transition-cond <expr>).
-	if (Forms.IsEmpty())
+	if (Forms.Num() == 0)
 	{
 		UAnimationTransitionGraph* TransGraph = Cast<UAnimationTransitionGraph>(Graph);
 		UAnimGraphNode_TransitionResult* ResultNode = TransGraph ? TransGraph->GetResultNode() : nullptr;
@@ -10351,7 +10441,7 @@ FBlueprintLispResult FBlueprintLispConverter::ExportPureExpression(
 	{
 		return FBlueprintLispResult::Fail(TEXT("ExportPureExpression: input pin or graph is null"));
 	}
-	if (InputPin->Direction != EGPD_Input || InputPin->LinkedTo.IsEmpty())
+	if (InputPin->Direction != EGPD_Input || InputPin->LinkedTo.Num() == 0)
 	{
 		return FBlueprintLispResult::Fail(TEXT("ExportPureExpression: pin is not a connected input"));
 	}
@@ -10372,7 +10462,7 @@ FBlueprintLispResult FBlueprintLispConverter::ExportPureExpression(
 	TSet<UEdGraphNode*> Visited;
 	const FLispNodePtr Expression = ConvertPureExpressionToLisp(
 		InputPin, InputPin->GetOwningNode()->GetGraph(), Visited, Options.bStableIds ? &ShortIds : nullptr);
-	if (!ExportErrors.IsEmpty())
+	if (ExportErrors.Num() != 0)
 	{
 		return FBlueprintLispResult::Fail(FString::Join(ExportErrors, TEXT("\n")));
 	}
@@ -10772,7 +10862,7 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		return FBlueprintLispResult::Fail(FString::Printf(TEXT("ImportGraph: parse error at %d:%d: %s"),
 			PR.ErrorLine, PR.ErrorColumn, *PR.Error));
 
-	if (PR.Nodes.IsEmpty())
+	if (PR.Nodes.Num() == 0)
 		return FBlueprintLispResult::Fail(TEXT("ImportGraph: no top-level expressions"));
 
 	FBPImportContext ValidationCtx;
@@ -11180,7 +11270,7 @@ FBlueprintLispResult FBlueprintLispConverter::ImportPureExpression(
 	Ctx.Blueprint = Graph->GetTypedOuter<UBlueprint>();
 	Ctx.Graph = Graph;
 	TargetPin->BreakAllPinLinks();
-	if (!IMP_SetPinFromExpr(TargetPin, ParseResult.Nodes[0], Ctx) || !Ctx.Errors.IsEmpty())
+	if (!IMP_SetPinFromExpr(TargetPin, ParseResult.Nodes[0], Ctx) || Ctx.Errors.Num() != 0)
 	{
 		return IMP_FailFromContext(Ctx, TEXT("ImportPureExpression failed"));
 	}
