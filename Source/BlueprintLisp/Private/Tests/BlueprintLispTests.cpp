@@ -6,6 +6,8 @@
 // Or in Editor:
 //   Window -> Developer Tools -> Session Frontend -> Automation
 
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
+
 #include "CoreMinimal.h"
 #include "Misc/AutomationTest.h"
 #include "BlueprintLispAST.h"
@@ -18,7 +20,9 @@
 // ============================================================================
 
 // Standard test flags: runs in Editor + Commandlet context, ProductFilter
-#define BL_FLAGS (EAutomationTestFlags::EditorContext | EAutomationTestFlags::CommandletContext | EAutomationTestFlags::ProductFilter)
+constexpr uint32 BL_FLAGS = static_cast<uint32>(EAutomationTestFlags::EditorContext)
+	| static_cast<uint32>(EAutomationTestFlags::CommandletContext)
+	| static_cast<uint32>(EAutomationTestFlags::ProductFilter);
 
 #define BL_TEST(Name) \
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(F##Name, "BlueprintLisp." #Name, BL_FLAGS)
@@ -1156,7 +1160,7 @@ bool FFunctionReturn_SelectRoundTripsLocaleIndependent::RunTest(const FString& P
 	return true;
 }
 
-#if ENGINE_MAJOR_VERSION >= 5
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 8)
 BL_TEST(FunctionMetadata_ThreadSafeRoundTrips)
 bool FFunctionMetadata_ThreadSafeRoundTrips::RunTest(const FString& Parameters)
 {
@@ -1456,4 +1460,6 @@ bool FLifecycle_HookPriorityOrdering::RunTest(const FString& Parameters)
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS
+
+#endif // UE 5.8+
 

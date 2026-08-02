@@ -7,8 +7,15 @@ public class BlueprintLisp : ModuleRules
 	public BlueprintLisp(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-		// UE 4.27 supports C++17; the plugin does not require C++20 language features.
-		CppStandard = CppStandardVersion.Cpp17;
+		CppStandard = Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 8
+			? (CppStandardVersion)System.Enum.Parse(typeof(CppStandardVersion), "Cpp20")
+			: CppStandardVersion.Cpp17;
+		PublicDefinitions.Add("ENGINE_MAJOR_VERSION=" + Target.Version.MajorVersion);
+		PublicDefinitions.Add("ENGINE_MINOR_VERSION=" + Target.Version.MinorVersion);
+		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion <= 3)
+		{
+			PublicDefinitions.Add("__has_feature(x)=0");
+		}
 
 		// Public: available to dependent modules
 		PublicDependencyModuleNames.AddRange(new string[]
