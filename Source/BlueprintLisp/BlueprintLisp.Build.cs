@@ -7,9 +7,10 @@ public class BlueprintLisp : ModuleRules
 	public BlueprintLisp(ReadOnlyTargetRules Target) : base(Target)
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
-		CppStandard = Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 8
-			? (CppStandardVersion)System.Enum.Parse(typeof(CppStandardVersion), "Cpp20")
-			: CppStandardVersion.Cpp17;
+		string CppStandardName = Target.Version.MajorVersion > 5
+			|| (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion >= 5)
+			? "Cpp20" : "Cpp17";
+		CppStandard = (CppStandardVersion)System.Enum.Parse(typeof(CppStandardVersion), CppStandardName);
 		PublicDefinitions.Add("ENGINE_MAJOR_VERSION=" + Target.Version.MajorVersion);
 		PublicDefinitions.Add("ENGINE_MINOR_VERSION=" + Target.Version.MinorVersion);
 		if (Target.Version.MajorVersion == 5 && Target.Version.MinorVersion <= 3)

@@ -20,9 +20,9 @@
 // ============================================================================
 
 // Standard test flags: runs in Editor + Commandlet context, ProductFilter
-constexpr uint32 BL_FLAGS = static_cast<uint32>(EAutomationTestFlags::EditorContext)
-	| static_cast<uint32>(EAutomationTestFlags::CommandletContext)
-	| static_cast<uint32>(EAutomationTestFlags::ProductFilter);
+constexpr EAutomationTestFlags BL_FLAGS = EAutomationTestFlags::EditorContext
+	| EAutomationTestFlags::CommandletContext
+	| EAutomationTestFlags::ProductFilter;
 
 #define BL_TEST(Name) \
 	IMPLEMENT_SIMPLE_AUTOMATION_TEST(F##Name, "BlueprintLisp." #Name, BL_FLAGS)
