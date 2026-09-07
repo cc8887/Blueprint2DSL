@@ -44,6 +44,19 @@ Python 桥接类 `unreal.BlueprintLispPythonBridge` 提供：
 
 `MergeAppend` 是针对目标入口覆盖子图的稳定 ID 导入复用，不是保留整张图所有旧节点，也不是完整的语义 diff 引擎。当前 `UpdateGraphFromText`、`UpdateGraphFromFile`、C++ `Update()` 和 `UpdateSemantic` 模式尚未实现，请不要调用它们。
 
+### UE5.8 原生 MCP Toolset
+
+UE5.8 Editor 可以把 `MCP/BlueprintLispMCP` 复制到项目的 `Plugins/BlueprintLispMCP/`，再启用该 companion plugin 以及引擎插件 **Toolset Registry** 和 **Model Context Protocol / Unreal MCP**。该 companion plugin 只在 UE5.8 及以上构建，核心 `BlueprintLisp` 插件仍保持原有跨版本兼容。
+
+Toolset 标识为 `BlueprintLispMCP.BlueprintLispToolset`，当前暴露以下内存操作：
+
+- Read：`ExportBlueprintGraph`、`ListBlueprintGraphs`、`ListBlueprintMemberVariables`、`InspectBlueprintMemberVariable`、`ValidateBlueprintLisp`
+- Write：`ReplaceBlueprintGraph`、`MergeBlueprintGraph`
+
+这些工具只接收 Unreal 资产路径和内存中的 `.bplisp` DSL 文本，不暴露任意文件读写、`ExportStub` 或文件路径版 Python bridge。Tool-search 模式下通过 `list_toolsets`、`describe_toolset`、`call_tool` 发现；关闭 tool-search 时，完整工具名为 `BlueprintLispMCP.BlueprintLispToolset.<FunctionName>`。
+
+当前 `UpdateSemantic` / `UpdateGraphFromText` 仍未实现，因此没有注册对应 MCP tool。需要局部修改时使用 `MergeBlueprintGraph`，并在副本上先验证编译和回导出结果。
+
 ### 导入模式
 
 - `ReplaceGraph`：清理目标图中可替换的节点后重建，适合完整覆盖；这是默认模式。

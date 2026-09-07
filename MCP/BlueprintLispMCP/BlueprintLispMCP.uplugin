@@ -1,0 +1,32 @@
+{
+    "FileVersion": 3,
+    "Version": 1,
+    "VersionName": "1.0.0",
+    "Name": "BlueprintLispMCP",
+    "FriendlyName": "BlueprintLisp MCP",
+    "Description": "UE5.8 native MCP Toolset adapter for BlueprintLisp",
+    "Category": "AI",
+    "CanContainContent": false,
+    "EnabledByDefault": false,
+    "Modules": [
+        {
+            "Name": "BlueprintLispMCP",
+            "Type": "Editor",
+            "LoadingPhase": "Default"
+        }
+    ],
+    "Plugins": [
+        {
+            "Name": "BlueprintLisp",
+            "Enabled": true
+        },
+        {
+            "Name": "ToolsetRegistry",
+            "Enabled": true
+        },
+        {
+            "Name": "ModelContextProtocol",
+            "Enabled": true
+        }
+    ]
+}

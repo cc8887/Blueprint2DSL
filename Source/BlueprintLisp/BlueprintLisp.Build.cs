@@ -34,7 +34,6 @@ public class BlueprintLisp : ModuleRules
 			"UnrealEd",
 			"BlueprintGraph",
 			"Kismet",
-			"KismetCompiler",
 			"GraphEditor",
 			"EditorSubsystem",
 			"AssetRegistry",
