@@ -46,6 +46,7 @@
 #include "K2Node_DynamicCast.h"
 #include "K2Node_GenericCreateObject.h"
 #include "K2Node_ExecutionSequence.h"
+#include "K2Node_Timeline.h"
 #include "K2Node_Switch.h"
 #include "K2Node_SwitchInteger.h"
 #include "K2Node_SwitchString.h"
@@ -78,6 +79,11 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/Character.h"
 #include "Engine/LevelScriptBlueprint.h"
+#include "Engine/TimelineTemplate.h"
+#include "Curves/CurveFloat.h"
+#include "Curves/CurveVector.h"
+#include "Curves/CurveLinearColor.h"
+#include "Curves/RichCurve.h"
 #include "UObject/UnrealType.h"
 
 
@@ -177,7 +183,7 @@ static void EXP_AddExportError(const FString& Error)
 
 // Forward declarations
 static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, const TMap<FGuid, FString>* ShortIds = nullptr);
-static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds);
+static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraphPin* EnteredExecPin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds);
 static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds);
 
 // ImportGraph helper (defined below after ExportGraph helpers)
@@ -477,6 +483,145 @@ static FLispNodePtr EXP_BuildMacroCallForm(UK2Node_MacroInstance* MacroInst, UEd
 	return ShortIds ? AppendNodeId(FLispNode::MakeList(Args), MacroInst, *ShortIds) : FLispNode::MakeList(Args);
 }
 
+static const TCHAR* EXP_RichCurveInterpModeName(ERichCurveInterpMode Mode)
+{
+	switch (Mode)
+	{
+	case RCIM_Linear: return TEXT("linear");
+	case RCIM_Constant: return TEXT("constant");
+	case RCIM_Cubic: return TEXT("cubic");
+	case RCIM_None: return TEXT("none");
+	default: return TEXT("none");
+	}
+}
+
+static FString BP_NumberToRoundTripString(const double Value)
+{
+	return FString::Printf(TEXT("%.17g"), Value);
+}
+
+static const TCHAR* EXP_RichCurveTangentModeName(ERichCurveTangentMode Mode)
+{
+	switch (Mode)
+	{
+	case RCTM_Auto: return TEXT("auto");
+	case RCTM_User: return TEXT("user");
+	case RCTM_Break: return TEXT("break");
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+	case RCTM_SmartAuto: return TEXT("smart-auto");
+#endif
+	case RCTM_None: return TEXT("none");
+	default: return TEXT("none");
+	}
+}
+
+static const TCHAR* EXP_RichCurveTangentWeightModeName(ERichCurveTangentWeightMode Mode)
+{
+	switch (Mode)
+	{
+	case RCTWM_WeightedNone: return TEXT("none");
+	case RCTWM_WeightedArrive: return TEXT("arrive");
+	case RCTWM_WeightedLeave: return TEXT("leave");
+	case RCTWM_WeightedBoth: return TEXT("both");
+	default: return TEXT("none");
+	}
+}
+
+static const TCHAR* EXP_RichCurveExtrapolationName(ERichCurveExtrapolation Mode)
+{
+	switch (Mode)
+	{
+	case RCCE_Cycle: return TEXT("cycle");
+	case RCCE_CycleWithOffset: return TEXT("cycle-with-offset");
+	case RCCE_Oscillate: return TEXT("oscillate");
+	case RCCE_Linear: return TEXT("linear");
+	case RCCE_Constant: return TEXT("constant");
+	case RCCE_None: return TEXT("none");
+	default: return TEXT("constant");
+	}
+}
+
+static FLispNodePtr EXP_RichCurveToLisp(const FRichCurve& Curve)
+{
+	TArray<FLispNodePtr> Args;
+	Args.Add(FLispNode::MakeSymbol(TEXT("rich-curve")));
+	if (Curve.GetDefaultValue() != MAX_flt)
+	{
+		Args.Add(FLispNode::MakeKeyword(TEXT(":default")));
+		Args.Add(FLispNode::MakeNumber(Curve.GetDefaultValue()));
+	}
+	Args.Add(FLispNode::MakeKeyword(TEXT(":pre-extrap")));
+	Args.Add(FLispNode::MakeSymbol(EXP_RichCurveExtrapolationName(Curve.PreInfinityExtrap)));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":post-extrap")));
+	Args.Add(FLispNode::MakeSymbol(EXP_RichCurveExtrapolationName(Curve.PostInfinityExtrap)));
+
+	for (const FRichCurveKey& Key : Curve.GetConstRefOfKeys())
+	{
+		TArray<FLispNodePtr> KeyArgs;
+		KeyArgs.Add(FLispNode::MakeSymbol(TEXT("key")));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":time")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.Time));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":value")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.Value));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":interp")));
+		KeyArgs.Add(FLispNode::MakeSymbol(EXP_RichCurveInterpModeName(Key.InterpMode)));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":tangent")));
+		KeyArgs.Add(FLispNode::MakeSymbol(EXP_RichCurveTangentModeName(Key.TangentMode)));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":weight")));
+		KeyArgs.Add(FLispNode::MakeSymbol(EXP_RichCurveTangentWeightModeName(Key.TangentWeightMode)));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":arrive")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.ArriveTangent));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":leave")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.LeaveTangent));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":arrive-weight")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.ArriveTangentWeight));
+		KeyArgs.Add(FLispNode::MakeKeyword(TEXT(":leave-weight")));
+		KeyArgs.Add(FLispNode::MakeNumber(Key.LeaveTangentWeight));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":key")));
+		Args.Add(FLispNode::MakeList(KeyArgs));
+	}
+	return FLispNode::MakeList(Args);
+}
+
+static FLispNodePtr EXP_CurveAssetToLisp(const UCurveBase* Curve)
+{
+	if (!Curve) return FLispNode::MakeNil();
+	return FLispNode::MakeList({
+		FLispNode::MakeSymbol(TEXT("asset")),
+		FLispNode::MakeString(Curve->GetPathName())
+	});
+}
+
+static FLispNodePtr EXP_VectorCurveToLisp(const UCurveVector* Curve)
+{
+	if (!Curve) return FLispNode::MakeNil();
+	return FLispNode::MakeList({
+		FLispNode::MakeSymbol(TEXT("vector-curve")),
+		FLispNode::MakeKeyword(TEXT(":x")), EXP_RichCurveToLisp(Curve->FloatCurves[0]),
+		FLispNode::MakeKeyword(TEXT(":y")), EXP_RichCurveToLisp(Curve->FloatCurves[1]),
+		FLispNode::MakeKeyword(TEXT(":z")), EXP_RichCurveToLisp(Curve->FloatCurves[2])
+	});
+}
+
+static FLispNodePtr EXP_LinearColorCurveToLisp(const UCurveLinearColor* Curve)
+{
+	if (!Curve) return FLispNode::MakeNil();
+	return FLispNode::MakeList({
+		FLispNode::MakeSymbol(TEXT("linear-color-curve")),
+		FLispNode::MakeKeyword(TEXT(":r")), EXP_RichCurveToLisp(Curve->FloatCurves[0]),
+		FLispNode::MakeKeyword(TEXT(":g")), EXP_RichCurveToLisp(Curve->FloatCurves[1]),
+		FLispNode::MakeKeyword(TEXT(":b")), EXP_RichCurveToLisp(Curve->FloatCurves[2]),
+		FLispNode::MakeKeyword(TEXT(":a")), EXP_RichCurveToLisp(Curve->FloatCurves[3]),
+		FLispNode::MakeKeyword(TEXT(":adjust-hue")), FLispNode::MakeNumber(Curve->AdjustHue),
+		FLispNode::MakeKeyword(TEXT(":adjust-saturation")), FLispNode::MakeNumber(Curve->AdjustSaturation),
+		FLispNode::MakeKeyword(TEXT(":adjust-brightness")), FLispNode::MakeNumber(Curve->AdjustBrightness),
+		FLispNode::MakeKeyword(TEXT(":adjust-brightness-curve")), FLispNode::MakeNumber(Curve->AdjustBrightnessCurve),
+		FLispNode::MakeKeyword(TEXT(":adjust-vibrance")), FLispNode::MakeNumber(Curve->AdjustVibrance),
+		FLispNode::MakeKeyword(TEXT(":adjust-min-alpha")), FLispNode::MakeNumber(Curve->AdjustMinAlpha),
+		FLispNode::MakeKeyword(TEXT(":adjust-max-alpha")), FLispNode::MakeNumber(Curve->AdjustMaxAlpha)
+	});
+}
+
 
 
 // ----- Convert pure (data-flow) expression to Lisp -----
@@ -572,6 +717,26 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 	if (!SourcePin) return FLispNode::MakeNil();
 	UEdGraphNode* SourceNode = SourcePin->GetOwningNode();
 	if (!SourceNode) return FLispNode::MakeNil();
+	if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(SourceNode))
+	{
+		if (SourcePin->Direction != EGPD_Output
+			|| SourcePin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+		{
+			EXP_AddExportError(FString::Printf(
+				TEXT("Timeline '%s' pin '%s' is not a data output"),
+				*TimelineNode->TimelineName.ToString(), *SourcePin->PinName.ToString()));
+			return FLispNode::MakeSymbol(TEXT("invalid-timeline-output"));
+		}
+
+		TArray<FLispNodePtr> Args;
+		Args.Add(FLispNode::MakeSymbol(TEXT("timeline-output")));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":timeline")));
+		Args.Add(FLispNode::MakeString(TimelineNode->TimelineName.ToString()));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":out-pin")));
+		Args.Add(FLispNode::MakeString(SourcePin->PinName.ToString()));
+		FLispNodePtr Form = FLispNode::MakeList(Args);
+		return ShortIds ? AppendNodeId(Form, TimelineNode, *ShortIds) : Form;
+	}
 
 	if (EXP_IsEntryValueSource(SourceNode))
 	{
@@ -1209,9 +1374,46 @@ static FLispNodePtr ConvertPureExpressionToLisp(UEdGraphPin* ValuePin, UEdGraph*
 }
 
 // ----- Convert a single exec node to Lisp -----
-static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds)
+static FLispNodePtr ConvertNodeToLisp(UEdGraphNode* Node, UEdGraphPin* EnteredExecPin, UEdGraph* Graph, TSet<UEdGraphNode*>& Visited, bool bPositions, const TMap<FGuid, FString>& ShortIds)
 {
 	if (!Node) return FLispNode::MakeNil();
+
+	// Timeline controls are asynchronous commands into a shared state node. The pin
+	// used to enter the node is part of the semantic operation and must not be
+	// collapsed to the node's first exec input/output.
+	if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+	{
+		FString Action;
+		if (EnteredExecPin == TimelineNode->GetPlayPin()) Action = TEXT("play");
+		else if (EnteredExecPin == TimelineNode->GetPlayFromStartPin()) Action = TEXT("play-from-start");
+		else if (EnteredExecPin == TimelineNode->GetStopPin()) Action = TEXT("stop");
+		else if (EnteredExecPin == TimelineNode->GetReversePin()) Action = TEXT("reverse");
+		else if (EnteredExecPin == TimelineNode->GetReverseFromEndPin()) Action = TEXT("reverse-from-end");
+		else if (EnteredExecPin == TimelineNode->GetSetNewTimePin()) Action = TEXT("set-new-time");
+
+		if (Action.IsEmpty())
+		{
+			EXP_AddExportError(FString::Printf(
+				TEXT("Timeline '%s' was entered through unsupported exec pin '%s'"),
+				*TimelineNode->TimelineName.ToString(),
+				EnteredExecPin ? *EnteredExecPin->PinName.ToString() : TEXT("<none>")));
+			return FLispNode::MakeSymbol(TEXT("invalid-timeline-control"));
+		}
+
+		TArray<FLispNodePtr> Args;
+		Args.Add(FLispNode::MakeSymbol(TEXT("timeline-control")));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":timeline")));
+		Args.Add(FLispNode::MakeString(TimelineNode->TimelineName.ToString()));
+		Args.Add(FLispNode::MakeKeyword(TEXT(":action")));
+		Args.Add(FLispNode::MakeSymbol(Action));
+		if (Action == TEXT("set-new-time"))
+		{
+			Args.Add(FLispNode::MakeKeyword(TEXT(":time")));
+			Args.Add(ConvertPureExpressionToLisp(TimelineNode->GetNewTimePin(), Graph, Visited, &ShortIds));
+		}
+		return FLispNode::MakeList(Args);
+	}
+
 	if (Visited.Contains(Node)) return FLispNode::MakeNil();
 	Visited.Add(Node);
 
@@ -1772,8 +1974,31 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 
 	while (CurrentPin && CurrentPin->LinkedTo.Num() > 0)
 	{
-		UEdGraphNode* NextNode = CurrentPin->LinkedTo[0]->GetOwningNode();
-		if (!NextNode || Visited.Contains(NextNode)) break;
+		UEdGraphPin* EnteredExecPin = CurrentPin->LinkedTo[0];
+		UEdGraphNode* NextNode = EnteredExecPin ? EnteredExecPin->GetOwningNode() : nullptr;
+		if (!NextNode) break;
+		if (Visited.Contains(NextNode) && !Cast<UK2Node_Timeline>(NextNode))
+		{
+			const FString* StableId = ShortIds.Find(NextNode->NodeGuid);
+			if (!StableId)
+			{
+				EXP_AddExportError(FString::Printf(
+					TEXT("Exec node '%s' is reached by multiple execution paths but has no stable id"),
+					*NextNode->GetName()));
+				break;
+			}
+			TArray<FLispNodePtr> RefArgs;
+			RefArgs.Add(FLispNode::MakeSymbol(TEXT("exec-ref")));
+			RefArgs.Add(FLispNode::MakeKeyword(TEXT(":id")));
+			RefArgs.Add(FLispNode::MakeString(*StableId));
+			if (EnteredExecPin && !EnteredExecPin->PinName.IsNone())
+			{
+				RefArgs.Add(FLispNode::MakeKeyword(TEXT(":exec-in")));
+				RefArgs.Add(FLispNode::MakeString(EnteredExecPin->PinName.ToString()));
+			}
+			Statements.Add(FLispNode::MakeList(RefArgs));
+			break;
+		}
 
 		if (UK2Node_Knot* KnotNode = Cast<UK2Node_Knot>(NextNode))
 		{
@@ -1796,12 +2021,16 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 			if (TE->DrawNodeAsEntry() && !Cast<UK2Node_MacroInstance>(NextNode)) break;
 		}
 
-		FLispNodePtr NodeLisp = ConvertNodeToLisp(NextNode, Graph, Visited, bPositions, ShortIds);
+		FLispNodePtr NodeLisp = ConvertNodeToLisp(NextNode, EnteredExecPin, Graph, Visited, bPositions, ShortIds);
 		if (NodeLisp.IsValid() && !NodeLisp->IsNil())
 			Statements.Add(NodeLisp);
 
 		// branch / sequence terminate the chain (their downstream exec paths are handled inside ConvertNodeToLisp)
 		if (Cast<UK2Node_IfThenElse>(NextNode) || Cast<UK2Node_ExecutionSequence>(NextNode)) break;
+
+		// Timeline Update/Finished/event pins are callbacks exported by the top-level
+		// timeline definition, not synchronous continuation pins.
+		if (Cast<UK2Node_Timeline>(NextNode)) break;
 
 		// Exit tunnel terminates the chain (macro exit point)
 
@@ -1822,6 +2051,295 @@ static FLispNodePtr ConvertExecChainToLisp(UEdGraphPin* ExecPin, UEdGraph* Graph
 	Seq.Add(FLispNode::MakeSymbol(TEXT("seq")));
 	Seq.Append(Statements);
 	return FLispNode::MakeList(Seq);
+}
+
+static void EXP_AppendTimelineTrackEditorState(TArray<FLispNodePtr>& Args, const FTTTrackBase& Track)
+{
+	Args.Add(FLispNode::MakeKeyword(TEXT(":external")));
+	Args.Add(FLispNode::MakeSymbol(Track.bIsExternalCurve ? TEXT("true") : TEXT("false")));
+#if WITH_EDITORONLY_DATA
+	Args.Add(FLispNode::MakeKeyword(TEXT(":expanded")));
+	Args.Add(FLispNode::MakeSymbol(Track.bIsExpanded ? TEXT("true") : TEXT("false")));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":curve-view-synchronized")));
+	Args.Add(FLispNode::MakeSymbol(Track.bIsCurveViewSynchronized ? TEXT("true") : TEXT("false")));
+#endif
+}
+
+static bool BP_IsTimelineReservedPinName(const FString& TrackName)
+{
+	static const TSet<FString> ReservedPinNames = {
+		TEXT("play"), TEXT("playfromstart"), TEXT("stop"), TEXT("reverse"),
+		TEXT("reversefromend"), TEXT("update"), TEXT("finished"),
+		TEXT("setnewtime"), TEXT("newtime"), TEXT("direction")
+	};
+	return ReservedPinNames.Contains(TrackName.ToLower());
+}
+
+static void EXP_AppendTimelineTrack(
+	TArray<FLispNodePtr>& TimelineArgs,
+	UTimelineTemplate* Template,
+	const FTTTrackId& TrackId)
+{
+	if (!Template) return;
+
+	TArray<FLispNodePtr> TrackArgs;
+	FLispNodePtr CurveForm = FLispNode::MakeNil();
+	FString TrackName;
+	bool bExternal = false;
+
+	if (TrackId.TrackType == FTTTrackBase::TT_Event && Template->EventTracks.IsValidIndex(TrackId.TrackIndex))
+	{
+		const FTTEventTrack& Track = Template->EventTracks[TrackId.TrackIndex];
+		TrackArgs.Add(FLispNode::MakeSymbol(TEXT("event")));
+		TrackArgs.Add(FLispNode::MakeString(Track.GetTrackName().ToString()));
+		EXP_AppendTimelineTrackEditorState(TrackArgs, Track);
+		TrackName = Track.GetTrackName().ToString();
+		bExternal = Track.bIsExternalCurve;
+		CurveForm = bExternal ? EXP_CurveAssetToLisp(Track.CurveKeys)
+			: (Track.CurveKeys ? EXP_RichCurveToLisp(Track.CurveKeys->FloatCurve) : FLispNode::MakeNil());
+	}
+	else if (TrackId.TrackType == FTTTrackBase::TT_FloatInterp && Template->FloatTracks.IsValidIndex(TrackId.TrackIndex))
+	{
+		const FTTFloatTrack& Track = Template->FloatTracks[TrackId.TrackIndex];
+		TrackArgs.Add(FLispNode::MakeSymbol(TEXT("float")));
+		TrackArgs.Add(FLispNode::MakeString(Track.GetTrackName().ToString()));
+		EXP_AppendTimelineTrackEditorState(TrackArgs, Track);
+		TrackName = Track.GetTrackName().ToString();
+		bExternal = Track.bIsExternalCurve;
+		CurveForm = bExternal ? EXP_CurveAssetToLisp(Track.CurveFloat)
+			: (Track.CurveFloat ? EXP_RichCurveToLisp(Track.CurveFloat->FloatCurve) : FLispNode::MakeNil());
+	}
+	else if (TrackId.TrackType == FTTTrackBase::TT_VectorInterp && Template->VectorTracks.IsValidIndex(TrackId.TrackIndex))
+	{
+		const FTTVectorTrack& Track = Template->VectorTracks[TrackId.TrackIndex];
+		TrackArgs.Add(FLispNode::MakeSymbol(TEXT("vector")));
+		TrackArgs.Add(FLispNode::MakeString(Track.GetTrackName().ToString()));
+		EXP_AppendTimelineTrackEditorState(TrackArgs, Track);
+		TrackName = Track.GetTrackName().ToString();
+		bExternal = Track.bIsExternalCurve;
+		CurveForm = bExternal ? EXP_CurveAssetToLisp(Track.CurveVector) : EXP_VectorCurveToLisp(Track.CurveVector);
+	}
+	else if (TrackId.TrackType == FTTTrackBase::TT_LinearColorInterp && Template->LinearColorTracks.IsValidIndex(TrackId.TrackIndex))
+	{
+		const FTTLinearColorTrack& Track = Template->LinearColorTracks[TrackId.TrackIndex];
+		TrackArgs.Add(FLispNode::MakeSymbol(TEXT("linear-color")));
+		TrackArgs.Add(FLispNode::MakeString(Track.GetTrackName().ToString()));
+		EXP_AppendTimelineTrackEditorState(TrackArgs, Track);
+		TrackName = Track.GetTrackName().ToString();
+		bExternal = Track.bIsExternalCurve;
+		CurveForm = bExternal ? EXP_CurveAssetToLisp(Track.CurveLinearColor) : EXP_LinearColorCurveToLisp(Track.CurveLinearColor);
+	}
+	else
+	{
+		EXP_AddExportError(FString::Printf(
+			TEXT("Timeline '%s' contains an invalid display track (%d, %d)"),
+			*Template->GetVariableName().ToString(), TrackId.TrackType, TrackId.TrackIndex));
+		return;
+	}
+	if (BP_IsTimelineReservedPinName(TrackName))
+	{
+		EXP_AddExportError(FString::Printf(
+			TEXT("Timeline '%s' track '%s' conflicts with a fixed Timeline pin name"),
+			*Template->GetVariableName().ToString(), *TrackName));
+		return;
+	}
+
+	if (!CurveForm.IsValid() || CurveForm->IsNil())
+	{
+		EXP_AddExportError(FString::Printf(
+			TEXT("Timeline '%s' track '%s' has no valid %s curve"),
+			*Template->GetVariableName().ToString(), *TrackName,
+			bExternal ? TEXT("external") : TEXT("internal")));
+		return;
+	}
+
+	TrackArgs.Add(FLispNode::MakeKeyword(TEXT(":curve")));
+	TrackArgs.Add(CurveForm);
+	TimelineArgs.Add(FLispNode::MakeKeyword(TEXT(":track")));
+	TimelineArgs.Add(FLispNode::MakeList(TrackArgs));
+}
+
+static void EXP_CollectExecSourcesThroughKnots(
+	UEdGraphPin* ExecInputPin,
+	TSet<UEdGraphPin*>& VisitedInputs,
+	TSet<UEdGraphPin*>& OutSourcePins)
+{
+	if (!ExecInputPin || VisitedInputs.Contains(ExecInputPin)) return;
+	VisitedInputs.Add(ExecInputPin);
+	for (UEdGraphPin* LinkedPin : ExecInputPin->LinkedTo)
+	{
+		if (!LinkedPin) continue;
+		if (UK2Node_Knot* KnotNode = Cast<UK2Node_Knot>(LinkedPin->GetOwningNode()))
+		{
+			EXP_CollectExecSourcesThroughKnots(
+				KnotNode->GetInputPin(), VisitedInputs, OutSourcePins);
+			continue;
+		}
+		OutSourcePins.Add(LinkedPin);
+	}
+}
+
+static void EXP_CollectTimelineCallbackExecNodesInternal(
+	UEdGraphPin* ExecPin,
+	TSet<UEdGraphNode*>& OutNodes,
+	TSet<UK2Node_Knot*>& VisitedKnots)
+{
+	if (!ExecPin) return;
+	for (UEdGraphPin* LinkedPin : ExecPin->LinkedTo)
+	{
+		UEdGraphNode* Node = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+		if (!Node || Cast<UK2Node_Timeline>(Node) || OutNodes.Contains(Node)) continue;
+		if (UK2Node_Knot* KnotNode = Cast<UK2Node_Knot>(Node))
+		{
+			if (!VisitedKnots.Contains(KnotNode))
+			{
+				VisitedKnots.Add(KnotNode);
+				EXP_CollectTimelineCallbackExecNodesInternal(
+					KnotNode->GetOutputPin(), OutNodes, VisitedKnots);
+			}
+			continue;
+		}
+		OutNodes.Add(Node);
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+			{
+				EXP_CollectTimelineCallbackExecNodesInternal(Pin, OutNodes, VisitedKnots);
+			}
+		}
+	}
+}
+
+static void EXP_CollectTimelineCallbackExecNodes(
+	UEdGraphPin* ExecPin,
+	TSet<UEdGraphNode*>& OutNodes)
+{
+	TSet<UK2Node_Knot*> VisitedKnots;
+	EXP_CollectTimelineCallbackExecNodesInternal(ExecPin, OutNodes, VisitedKnots);
+}
+
+static bool EXP_HasConvergentExecOwnership(UEdGraph* Graph)
+{
+	if (!Graph) return false;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (!Node || Cast<UK2Node_Timeline>(Node) || Cast<UK2Node_Knot>(Node)) continue;
+		TSet<UEdGraphPin*> SourcePins;
+		TSet<UEdGraphPin*> VisitedInputs;
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Input
+				&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+			{
+				EXP_CollectExecSourcesThroughKnots(Pin, VisitedInputs, SourcePins);
+			}
+		}
+		if (SourcePins.Num() > 1)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+static FLispNodePtr ConvertTimelineToLisp(
+	UK2Node_Timeline* TimelineNode,
+	UEdGraph* Graph,
+	bool bPositions,
+	const TMap<FGuid, FString>& ShortIds,
+	TSet<UEdGraphNode*>& ExecVisited)
+{
+	if (!TimelineNode || !Graph) return FLispNode::MakeNil();
+	UBlueprint* Blueprint = FBlueprintEditorUtils::FindBlueprintForGraph(Graph);
+	UTimelineTemplate* Template = Blueprint
+		? Blueprint->FindTimelineTemplateByVariableName(TimelineNode->TimelineName) : nullptr;
+	if (!Template)
+	{
+		EXP_AddExportError(FString::Printf(
+			TEXT("Timeline node '%s' has no template named '%s'"),
+			*TimelineNode->GetName(), *TimelineNode->TimelineName.ToString()));
+		return FLispNode::MakeSymbol(TEXT("invalid-timeline"));
+	}
+
+	TArray<FLispNodePtr> Args;
+	Args.Add(FLispNode::MakeSymbol(TEXT("timeline")));
+	Args.Add(FLispNode::MakeString(TimelineNode->TimelineName.ToString()));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":length")));
+	Args.Add(FLispNode::MakeNumber(Template->TimelineLength));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":length-mode")));
+	Args.Add(FLispNode::MakeSymbol(Template->LengthMode == TL_TimelineLength
+		? TEXT("timeline-length") : TEXT("last-key-frame")));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":autoplay")));
+	Args.Add(FLispNode::MakeSymbol(Template->bAutoPlay ? TEXT("true") : TEXT("false")));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":loop")));
+	Args.Add(FLispNode::MakeSymbol(Template->bLoop ? TEXT("true") : TEXT("false")));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":replicated")));
+	Args.Add(FLispNode::MakeSymbol(Template->bReplicated ? TEXT("true") : TEXT("false")));
+	Args.Add(FLispNode::MakeKeyword(TEXT(":ignore-time-dilation")));
+	Args.Add(FLispNode::MakeSymbol(Template->bIgnoreTimeDilation ? TEXT("true") : TEXT("false")));
+	for (const FBPVariableMetaDataEntry& Entry : Template->MetaDataArray)
+	{
+		Args.Add(FLispNode::MakeKeyword(TEXT(":metadata")));
+		Args.Add(FLispNode::MakeList({
+			FLispNode::MakeString(Entry.DataKey.ToString()),
+			FLispNode::MakeString(Entry.DataValue)
+		}));
+	}
+
+	TSet<FString> ExportedTracks;
+	auto AppendTrackOnce = [&Args, Template, &ExportedTracks](const FTTTrackId& TrackId)
+	{
+		const FString Key = FString::Printf(TEXT("%d:%d"), TrackId.TrackType, TrackId.TrackIndex);
+		if (ExportedTracks.Contains(Key)) return;
+		EXP_AppendTimelineTrack(Args, Template, TrackId);
+		ExportedTracks.Add(Key);
+	};
+	for (int32 DisplayIndex = 0; DisplayIndex < Template->GetNumDisplayTracks(); ++DisplayIndex)
+	{
+		AppendTrackOnce(Template->GetDisplayTrackId(DisplayIndex));
+	}
+	for (int32 Index = 0; Index < Template->EventTracks.Num(); ++Index) AppendTrackOnce(FTTTrackId(FTTTrackBase::TT_Event, Index));
+	for (int32 Index = 0; Index < Template->FloatTracks.Num(); ++Index) AppendTrackOnce(FTTTrackId(FTTTrackBase::TT_FloatInterp, Index));
+	for (int32 Index = 0; Index < Template->VectorTracks.Num(); ++Index) AppendTrackOnce(FTTTrackId(FTTTrackBase::TT_VectorInterp, Index));
+	for (int32 Index = 0; Index < Template->LinearColorTracks.Num(); ++Index) AppendTrackOnce(FTTTrackId(FTTTrackBase::TT_LinearColorInterp, Index));
+
+	auto ConvertCallback = [Graph, bPositions, &ShortIds, &ExecVisited](
+		const FString& CallbackName,
+		UEdGraphPin* ExecPin)
+	{
+		return ConvertExecChainToLisp(ExecPin, Graph, ExecVisited, bPositions, ShortIds);
+	};
+	auto AppendCallback = [&Args, &ConvertCallback](const TCHAR* Keyword, UEdGraphPin* ExecPin)
+	{
+		FLispNodePtr Body = ConvertCallback(Keyword, ExecPin);
+		if (Body.IsValid() && !Body->IsNil())
+		{
+			Args.Add(FLispNode::MakeKeyword(Keyword));
+			Args.Add(Body);
+		}
+	};
+	AppendCallback(TEXT(":update"), TimelineNode->GetUpdatePin());
+	AppendCallback(TEXT(":finished"), TimelineNode->GetFinishedPin());
+	for (const FTTEventTrack& EventTrack : Template->EventTracks)
+	{
+		UEdGraphPin* EventPin = TimelineNode->FindPin(EventTrack.GetTrackName(), EGPD_Output);
+		FLispNodePtr Body = ConvertCallback(EventTrack.GetTrackName().ToString(), EventPin);
+		if (Body.IsValid() && !Body->IsNil())
+		{
+			Args.Add(FLispNode::MakeKeyword(TEXT(":event")));
+			Args.Add(FLispNode::MakeList({
+				FLispNode::MakeString(EventTrack.GetTrackName().ToString()), Body
+			}));
+		}
+	}
+
+	if (bPositions)
+	{
+		Args.Add(FLispNode::MakeKeyword(TEXT(":pos")));
+		Args.Add(FLispNode::MakeString(FString::Printf(TEXT("%d,%d"), TimelineNode->NodePosX, TimelineNode->NodePosY)));
+	}
+	return AppendNodeId(FLispNode::MakeList(Args), TimelineNode, ShortIds);
 }
 
 static void AppendEventMetadata(TArray<FLispNodePtr>& EventArgs, UEdGraphNode* EventNode, bool bPositions,
@@ -1850,10 +2368,9 @@ static void AppendTruthyKeyword(TArray<FLispNodePtr>& EventArgs, const TCHAR* Ke
 }
 
 static void AppendExecBodyToArgs(TArray<FLispNodePtr>& EventArgs, UEdGraphPin* ExecOutPin, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortNodeIds, TSet<UEdGraphNode*>& ExecVisited)
 {
-	TSet<UEdGraphNode*> Visited;
-	FLispNodePtr Body = ConvertExecChainToLisp(ExecOutPin, Graph, Visited, bPositions, ShortNodeIds);
+	FLispNodePtr Body = ConvertExecChainToLisp(ExecOutPin, Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (!Body.IsValid() || Body->IsNil()) return;
 
 	if (BP_IsStructuralSeqWrapper(Body))
@@ -1907,7 +2424,8 @@ static bool EXP_ShouldSkipCustomEventParamPin(UK2Node_CustomEvent* Event, UEdGra
 // ----- Convert a standard K2Node_Event -----
 
 static FLispNodePtr ConvertEventToLisp(UK2Node_Event* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
 	FString EventName = Event->EventReference.GetMemberName().ToString();
 	if (EventName.IsEmpty()) EventName = Event->CustomFunctionName.ToString();
@@ -1918,12 +2436,13 @@ static FLispNodePtr ConvertEventToLisp(UK2Node_Event* Event, UEdGraph* Graph, bo
 	EventArgs.Add(EXP_MakeNameAtom(EventName));
 	AppendEventMetadata(EventArgs, Event, bPositions, ShortEventIds);
 
-	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds);
+	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds, ExecVisited);
 	return FLispNode::MakeList(EventArgs);
 }
 
 static FLispNodePtr ConvertInputActionToLisp(UK2Node_InputAction* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
 	TArray<FLispNodePtr> EventArgs;
 	EventArgs.Add(FLispNode::MakeSymbol(TEXT("input-action")));
@@ -1934,16 +2453,14 @@ static FLispNodePtr ConvertInputActionToLisp(UK2Node_InputAction* Event, UEdGrap
 	AppendTruthyKeyword(EventArgs, TEXT(":override-parent-binding"), Event->bOverrideParentBinding);
 	AppendEventMetadata(EventArgs, Event, bPositions, ShortEventIds);
 
-	TSet<UEdGraphNode*> PressedVisited;
-	FLispNodePtr PressedBody = ConvertExecChainToLisp(Event->GetPressedPin(), Graph, PressedVisited, bPositions, ShortNodeIds);
+	FLispNodePtr PressedBody = ConvertExecChainToLisp(Event->GetPressedPin(), Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (PressedBody.IsValid() && !PressedBody->IsNil())
 	{
 		EventArgs.Add(FLispNode::MakeKeyword(TEXT(":pressed")));
 		EventArgs.Add(PressedBody);
 	}
 
-	TSet<UEdGraphNode*> ReleasedVisited;
-	FLispNodePtr ReleasedBody = ConvertExecChainToLisp(Event->GetReleasedPin(), Graph, ReleasedVisited, bPositions, ShortNodeIds);
+	FLispNodePtr ReleasedBody = ConvertExecChainToLisp(Event->GetReleasedPin(), Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (ReleasedBody.IsValid() && !ReleasedBody->IsNil())
 	{
 		EventArgs.Add(FLispNode::MakeKeyword(TEXT(":released")));
@@ -1954,7 +2471,8 @@ static FLispNodePtr ConvertInputActionToLisp(UK2Node_InputAction* Event, UEdGrap
 }
 
 static FLispNodePtr ConvertInputKeyToLisp(UK2Node_InputKey* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
 	FString KeyName = Event->InputKey.GetFName().ToString();
 	if (KeyName.IsEmpty())
@@ -1975,16 +2493,14 @@ static FLispNodePtr ConvertInputKeyToLisp(UK2Node_InputKey* Event, UEdGraph* Gra
 	AppendTruthyKeyword(EventArgs, TEXT(":command"), Event->bCommand);
 	AppendEventMetadata(EventArgs, Event, bPositions, ShortEventIds);
 
-	TSet<UEdGraphNode*> PressedVisited;
-	FLispNodePtr PressedBody = ConvertExecChainToLisp(Event->GetPressedPin(), Graph, PressedVisited, bPositions, ShortNodeIds);
+	FLispNodePtr PressedBody = ConvertExecChainToLisp(Event->GetPressedPin(), Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (PressedBody.IsValid() && !PressedBody->IsNil())
 	{
 		EventArgs.Add(FLispNode::MakeKeyword(TEXT(":pressed")));
 		EventArgs.Add(PressedBody);
 	}
 
-	TSet<UEdGraphNode*> ReleasedVisited;
-	FLispNodePtr ReleasedBody = ConvertExecChainToLisp(Event->GetReleasedPin(), Graph, ReleasedVisited, bPositions, ShortNodeIds);
+	FLispNodePtr ReleasedBody = ConvertExecChainToLisp(Event->GetReleasedPin(), Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (ReleasedBody.IsValid() && !ReleasedBody->IsNil())
 	{
 		EventArgs.Add(FLispNode::MakeKeyword(TEXT(":released")));
@@ -2007,7 +2523,8 @@ static FName GetComponentBoundEventPropertyName(const UK2Node_ComponentBoundEven
 }
 
 static FLispNodePtr ConvertComponentBoundEventToLisp(UK2Node_ComponentBoundEvent* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
 	FString ComponentName = GetComponentBoundEventPropertyName(Event).ToString();
 	FString DelegateName = Event->GetDocumentationExcerptName();
@@ -2026,12 +2543,13 @@ static FLispNodePtr ConvertComponentBoundEventToLisp(UK2Node_ComponentBoundEvent
 	EventArgs.Add(FLispNode::MakeKeyword(TEXT(":delegate")));
 	EventArgs.Add(FLispNode::MakeString(DelegateName));
 	AppendEventMetadata(EventArgs, Event, bPositions, ShortEventIds);
-	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds);
+	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds, ExecVisited);
 	return FLispNode::MakeList(EventArgs);
 }
 
 static FLispNodePtr ConvertActorBoundEventToLisp(UK2Node_ActorBoundEvent* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
 	FString ActorName;
 	if (AActor* EventOwner = Event->GetReferencedLevelActor())
@@ -2059,16 +2577,16 @@ static FLispNodePtr ConvertActorBoundEventToLisp(UK2Node_ActorBoundEvent* Event,
 	EventArgs.Add(FLispNode::MakeKeyword(TEXT(":delegate")));
 	EventArgs.Add(FLispNode::MakeString(DelegateName));
 	AppendEventMetadata(EventArgs, Event, bPositions, ShortEventIds);
-	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds);
+	AppendExecBodyToArgs(EventArgs, GetThenPin(Event), Graph, bPositions, ShortNodeIds, ExecVisited);
 	return FLispNode::MakeList(EventArgs);
 }
 
 
 // ----- Convert a CustomEvent node -----
 static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
-	TSet<UEdGraphNode*> Visited;
 	FString EventName = Event->CustomFunctionName.ToString();
 
 	TArray<FLispNodePtr> EventArgs;
@@ -2098,7 +2616,7 @@ static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGrap
 
 
 	UEdGraphPin* ThenPin = GetThenPin(Event);
-	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, Visited, bPositions, ShortNodeIds);
+	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
 		if (BP_IsStructuralSeqWrapper(Body))
@@ -2115,9 +2633,9 @@ static FLispNodePtr ConvertCustomEventToLisp(UK2Node_CustomEvent* Event, UEdGrap
 // We export these as (function <name> [:param (name type)]... body...) to distinguish
 // them from event-driven graphs.
 static FLispNodePtr ConvertFunctionEntryToLisp(UK2Node_FunctionEntry* FuncEntry, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
-	TSet<UEdGraphNode*> Visited;
 
 	// Function name: prefer CustomGeneratedFunctionName, fallback to graph name
 	FString FuncName = FuncEntry->CustomGeneratedFunctionName.ToString();
@@ -2216,7 +2734,7 @@ static FLispNodePtr ConvertFunctionEntryToLisp(UK2Node_FunctionEntry* FuncEntry,
 
 	// Exec output -> body
 	UEdGraphPin* ThenPin = GetThenPin(FuncEntry);
-	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, Visited, bPositions, ShortNodeIds);
+	FLispNodePtr Body = ConvertExecChainToLisp(ThenPin, Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
 		if (BP_IsStructuralSeqWrapper(Body))
@@ -2234,9 +2752,9 @@ static FLispNodePtr ConvertFunctionEntryToLisp(UK2Node_FunctionEntry* FuncEntry,
 // We export these as (macro <name> [:param (name type)]... body...) to distinguish
 // them from event-driven and function graphs.
 static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGraph* Graph, bool bPositions,
-	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds)
+	const TMap<FGuid, FString>& ShortEventIds, const TMap<FGuid, FString>& ShortNodeIds,
+	TSet<UEdGraphNode*>& ExecVisited)
 {
-	TSet<UEdGraphNode*> Visited;
 
 	FString MacroName = Graph->GetName();
 
@@ -2318,7 +2836,7 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 			break;
 		}
 	}
-	FLispNodePtr Body = ConvertExecChainToLisp(TunnelExecOut, Graph, Visited, bPositions, ShortNodeIds);
+	FLispNodePtr Body = ConvertExecChainToLisp(TunnelExecOut, Graph, ExecVisited, bPositions, ShortNodeIds);
 	if (Body.IsValid() && !Body->IsNil())
 	{
 		if (BP_IsStructuralSeqWrapper(Body))
@@ -2360,7 +2878,7 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 					if (EPin->Direction == EGPD_Input && EPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec
 						&& !EPin->bHidden && EPin->PinName != UEdGraphSchema_K2::PN_Execute)
 					{
-						FLispNodePtr Val = ConvertPureExpressionToLisp(EPin, Graph, Visited);
+						FLispNodePtr Val = ConvertPureExpressionToLisp(EPin, Graph, ExecVisited);
 						if (!Val->IsNil())
 						{
 				ExitArgs.Add(FLispNode::MakeKeyword(TEXT(":output")));
@@ -2388,6 +2906,13 @@ static FLispNodePtr ConvertTunnelEntryToLisp(UK2Node_Tunnel* TunnelEntry, UEdGra
 /** Context for Lisp 鈫?Blueprint conversion (mirrors ECABridge's FLispToBPContext) */
 struct FBPImportContext
 {
+	struct FPendingExecReference
+	{
+		UEdGraphPin* SourcePin = nullptr;
+		FString StableId;
+		FString ExecInputName;
+	};
+
 	UBlueprint* Blueprint = nullptr;
 	UEdGraph*   Graph     = nullptr;
 	FBlueprintLispConverter::EImportMode ImportMode = FBlueprintLispConverter::EImportMode::ReplaceGraph;
@@ -2403,6 +2928,16 @@ struct FBPImportContext
 
 	TMap<FString, FString>       VariableToPin;    // var name 鈫?pin name
 	TMap<FString, UFunction*>    FunctionCache;    // deterministic function lookup cache
+	TMap<FString, UK2Node_Timeline*> TimelineNameToNode;
+	TMap<FString, UTimelineTemplate*> TimelineNameToTemplate;
+	TMap<FString, TArray<UEdGraphNode*>> TimelineReusableBodyNodes;
+	TMap<FString, TMap<FString, UEdGraphNode*>> TimelineReusableBodyStableIdToNode;
+	TSet<FString> TimelineReusableCallbackNames;
+	TMap<FString, FLispNodePtr> TimelineNewTimeExpressions;
+	TSet<FString> ImportedTimelineNewTimeNames;
+	TSet<FString> TouchedTimelineControlNames;
+	UEdGraphPin* PendingExplicitExecInputPin = nullptr;
+	TArray<FPendingExecReference> PendingExecReferences;
 
 	TArray<FString> Errors;
 	TArray<FString> Warnings;
@@ -2593,8 +3128,14 @@ static bool IMP_ApplyBlueprintVariableImportSpec(const FIMPBlueprintVariableImpo
 static void IMP_EnsureBlueprintVariablesFromTopLevelForms(const TArray<FLispNodePtr>& Nodes, FBPImportContext& Ctx);
 static void IMP_EnsureGuid(UEdGraphNode* N);
 static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N);
+static UEdGraphPin* IMP_GetExecInput(UEdGraphNode* N, FBPImportContext* Ctx = nullptr);
 static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGraphNode*>& OutNodes);
 static void IMP_CollectPureDependencyNodes(UEdGraphPin* ValuePin, TSet<UEdGraphNode*>& OutNodes);
+static void IMP_CollectReachableTimelineControlNames(
+	UEdGraphPin* ExecOutPin,
+	TSet<FString>& OutTimelineNames,
+	TSet<UEdGraphNode*>& VisitedNodes);
+static void IMP_ClearReusableNodeOwnedLinks(UEdGraphNode* Node, const TSet<UEdGraphNode*>& ReuseScope);
 
 
 
@@ -2624,6 +3165,19 @@ static EIMPGraphKind IMP_DetectGraphKind(UEdGraph* Graph)
 	}
 
 	return EIMPGraphKind::EventGraph;
+}
+
+static void IMP_RemoveGraphNode(UEdGraphNode* Node, UEdGraph* Graph)
+{
+	if (!Node || !Graph) return;
+	if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+	{
+		TimelineNode->DestroyNode();
+	}
+	else
+	{
+		Graph->RemoveNode(Node);
+	}
 }
 
 static void IMP_ClearGraphForReplace(UEdGraph* Graph, EIMPGraphKind Kind)
@@ -2659,7 +3213,9 @@ static void IMP_ClearGraphForReplace(UEdGraph* Graph, EIMPGraphKind Kind)
 
 	for (UEdGraphNode* N : NodesToRemove)
 	{
-		Graph->RemoveNode(N);
+		// UK2Node_Timeline::DestroyNode also removes and renames its template.
+		// Graph->RemoveNode alone leaves an orphan that blocks same-name import.
+		IMP_RemoveGraphNode(N, Graph);
 	}
 }
 
@@ -2771,7 +3327,11 @@ static FString IMP_GetRequestedNodeStableId(const FLispNodePtr& Form)
 	return IMP_GetKeywordAtomValue(Form, TEXT(":id")).ToLower();
 }
 
-static void IMP_ApplyRequestedStableId(UEdGraphNode* Node, const FLispNodePtr& Form, const bool bEventId)
+static void IMP_ApplyRequestedStableId(
+	UEdGraphNode* Node,
+	const FLispNodePtr& Form,
+	const bool bEventId,
+	const bool bPreserveMatchingGuid = false)
 {
 	if (!Node || !Form.IsValid()) return;
 	FString StableId = IMP_GetKeywordAtomValue(Form, bEventId ? TEXT(":event-id") : TEXT(":id")).ToLower();
@@ -2779,6 +3339,11 @@ static void IMP_ApplyRequestedStableId(UEdGraphNode* Node, const FLispNodePtr& F
 	for (const TCHAR Character : StableId)
 	{
 		if (!FChar::IsHexDigit(Character)) return;
+	}
+	if (bPreserveMatchingGuid && Node->NodeGuid.IsValid()
+		&& Node->NodeGuid.ToString(EGuidFormats::Digits).StartsWith(StableId, ESearchCase::IgnoreCase))
+	{
+		return;
 	}
 
 	const int32 PrefixLength = StableId.Len();
@@ -2817,6 +3382,9 @@ static void IMP_PrepareExistingEventBodyForIncrementalReuse(UEdGraphNode* EventN
 			continue;
 		}
 
+		TSet<UEdGraphNode*> VisitedControlNodes;
+		IMP_CollectReachableTimelineControlNames(
+			Pin, Ctx.TouchedTimelineControlNames, VisitedControlNodes);
 		IMP_CollectDownstreamExecNodes(Pin, NodesToReuse);
 		Pin->BreakAllPinLinks();
 	}
@@ -2831,7 +3399,6 @@ static void IMP_PrepareExistingEventBodyForIncrementalReuse(UEdGraphNode* EventN
 		IMP_EnsureGuid(Node);
 		Ctx.ReusableBodyNodes.Add(Node);
 		AllowedGuids.Add(Node->NodeGuid);
-		IMP_ClearAllNodeLinks(Node);
 	}
 
 	IMP_BuildStableIdIndex(Ctx.Graph, false, Ctx.ReusableBodyStableIdToNode, &AllowedGuids, nullptr);
@@ -2839,13 +3406,52 @@ static void IMP_PrepareExistingEventBodyForIncrementalReuse(UEdGraphNode* EventN
 
 static void IMP_FinalizeExistingEventBodyIncrementalReuse(FBPImportContext& Ctx)
 {
+	TSet<UEdGraphNode*> RemovableNodes;
 	for (UEdGraphNode* Node : Ctx.ReusableBodyNodes)
 	{
-		if (!Node || Ctx.ConsumedReusableBodyGuids.Contains(Node->NodeGuid))
+		if (!Node || Ctx.ConsumedReusableBodyGuids.Contains(Node->NodeGuid)) continue;
+		// Timeline nodes are shared asynchronous roots and never belong to an
+		// event/callback body reuse scope.
+		if (!Cast<UK2Node_Timeline>(Node)) RemovableNodes.Add(Node);
+	}
+
+	bool bChanged = true;
+	while (bChanged)
+	{
+		bChanged = false;
+		for (auto It = RemovableNodes.CreateIterator(); It; ++It)
 		{
-			continue;
+			UEdGraphNode* Node = *It;
+			bool bHasExternalOwner = false;
+			for (UEdGraphPin* Pin : Node->Pins)
+			{
+				if (!Pin || (Pin->Direction == EGPD_Input
+					&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)) continue;
+				for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+				{
+					UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+					const bool bOwnedTimelineControlLink = Cast<UK2Node_Timeline>(LinkedNode)
+						&& Pin->Direction == EGPD_Output
+						&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+					if (LinkedNode && !bOwnedTimelineControlLink
+						&& !RemovableNodes.Contains(LinkedNode))
+					{
+						bHasExternalOwner = true;
+						break;
+					}
+				}
+				if (bHasExternalOwner) break;
+			}
+			if (bHasExternalOwner)
+			{
+				It.RemoveCurrent();
+				bChanged = true;
+			}
 		}
-		Ctx.Graph->RemoveNode(Node);
+	}
+	for (UEdGraphNode* Node : RemovableNodes)
+	{
+		if (Node) Ctx.Graph->RemoveNode(Node);
 	}
 
 	IMP_ResetReusableBodyNodePool(Ctx);
@@ -2882,7 +3488,12 @@ static void IMP_MarkReusableBodyNodeConsumed(UEdGraphNode* Node, FBPImportContex
 		return;
 	}
 
-	IMP_ClearAllNodeLinks(Node);
+	TSet<UEdGraphNode*> ReuseScope;
+	for (UEdGraphNode* ReusableNode : Ctx.ReusableBodyNodes)
+	{
+		if (ReusableNode) ReuseScope.Add(ReusableNode);
+	}
+	IMP_ClearReusableNodeOwnedLinks(Node, ReuseScope);
 	Node->ReconstructNode();
 	Ctx.ConsumedReusableBodyGuids.Add(Node->NodeGuid);
 	Ctx.TempIdToNode.FindOrAdd(Node->NodeGuid.ToString()) = Node;
@@ -3240,6 +3851,12 @@ static UEdGraphNode* IMP_TryReuseOpaqueGenericBodyNode(const FLispNodePtr& Form,
 
 	if (UEdGraphNode* ReusableNode = IMP_FindReusableBodyNodeByStableId(Form, Ctx))
 	{
+		TSet<UEdGraphNode*> ReuseScope;
+		for (UEdGraphNode* Node : Ctx.ReusableBodyNodes)
+		{
+			if (Node) ReuseScope.Add(Node);
+		}
+		IMP_ClearReusableNodeOwnedLinks(ReusableNode, ReuseScope);
 		Ctx.ConsumedReusableBodyGuids.Add(ReusableNode->NodeGuid);
 		Ctx.TempIdToNode.FindOrAdd(ReusableNode->NodeGuid.ToString()) = ReusableNode;
 		Ctx.AdvancePosition();
@@ -3720,7 +4337,8 @@ static void IMP_CollectPureDependencyNodes(UEdGraphPin* ValuePin, TSet<UEdGraphN
 	for (UEdGraphPin* LinkedPin : ValuePin->LinkedTo)
 	{
 		UEdGraphNode* SourceNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
-		if (!SourceNode || OutNodes.Contains(SourceNode) || IMP_IsEventStableIdNode(SourceNode))
+		if (!SourceNode || OutNodes.Contains(SourceNode) || IMP_IsEventStableIdNode(SourceNode)
+			|| Cast<UK2Node_Timeline>(SourceNode))
 		{
 			continue;
 		}
@@ -3737,6 +4355,33 @@ static void IMP_CollectPureDependencyNodes(UEdGraphPin* ValuePin, TSet<UEdGraphN
 	}
 }
 
+static void IMP_CollectReachableTimelineControlNames(
+	UEdGraphPin* ExecOutPin,
+	TSet<FString>& OutTimelineNames,
+	TSet<UEdGraphNode*>& VisitedNodes)
+{
+	if (!ExecOutPin) return;
+	for (UEdGraphPin* LinkedPin : ExecOutPin->LinkedTo)
+	{
+		UEdGraphNode* Node = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+		if (!Node || VisitedNodes.Contains(Node)) continue;
+		VisitedNodes.Add(Node);
+		if (const UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+		{
+			OutTimelineNames.Add(TimelineNode->TimelineName.ToString().ToLower());
+			continue;
+		}
+		for (UEdGraphPin* Pin : Node->Pins)
+		{
+			if (Pin && Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+			{
+				IMP_CollectReachableTimelineControlNames(Pin, OutTimelineNames, VisitedNodes);
+			}
+		}
+	}
+}
+
 static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGraphNode*>& OutNodes)
 {
 	if (!ExecOutPin)
@@ -3747,7 +4392,8 @@ static void IMP_CollectDownstreamExecNodes(UEdGraphPin* ExecOutPin, TSet<UEdGrap
 	for (UEdGraphPin* LinkedPin : ExecOutPin->LinkedTo)
 	{
 		UEdGraphNode* NextNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
-		if (!NextNode || OutNodes.Contains(NextNode) || Cast<UK2Node_Event>(NextNode))
+		if (!NextNode || OutNodes.Contains(NextNode) || Cast<UK2Node_Event>(NextNode)
+			|| Cast<UK2Node_Timeline>(NextNode))
 		{
 			continue;
 		}
@@ -3789,7 +4435,37 @@ static void IMP_ClearExistingEventExecChain(UK2Node_Event* EventNode, FBPImportC
 
 	for (UEdGraphNode* Node : NodesToRemove)
 	{
+		if (Cast<UK2Node_Timeline>(Node)) continue;
 		Ctx.Graph->RemoveNode(Node);
+	}
+}
+
+static void IMP_ClearReusableNodeOwnedLinks(
+	UEdGraphNode* Node,
+	const TSet<UEdGraphNode*>& ReuseScope)
+{
+	if (!Node) return;
+	for (UEdGraphPin* Pin : Node->Pins)
+	{
+		if (!Pin) continue;
+		if (Pin->Direction == EGPD_Input
+			&& Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		{
+			Pin->BreakAllPinLinks();
+			continue;
+		}
+		const TArray<UEdGraphPin*> LinkedPins = Pin->LinkedTo;
+		for (UEdGraphPin* LinkedPin : LinkedPins)
+		{
+			UEdGraphNode* LinkedNode = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+			const bool bOwnedTimelineControlLink = Cast<UK2Node_Timeline>(LinkedNode)
+				&& Pin->Direction == EGPD_Output
+				&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec;
+			if (LinkedNode && (ReuseScope.Contains(LinkedNode) || bOwnedTimelineControlLink))
+			{
+				Pin->BreakLinkTo(LinkedPin);
+			}
+		}
 	}
 }
 
@@ -4171,6 +4847,10 @@ static bool IMP_TryCreateConnection(UEdGraph* Graph, UEdGraphPin* Src, UEdGraphP
 		if (OutError) *OutError = TEXT("null pin");
 		return false;
 	}
+	if (Src->LinkedTo.Contains(Dst) && Dst->LinkedTo.Contains(Src))
+	{
+		return true;
+	}
 	if (!Graph || !Graph->GetSchema())
 	{
 		if (OutError) *OutError = TEXT("graph schema is null");
@@ -4470,9 +5150,16 @@ static UEdGraphPin* IMP_GetExecOutput(UEdGraphNode* N)
 			return P;
 	return nullptr;
 }
-static UEdGraphPin* IMP_GetExecInput(UEdGraphNode* N)
+static UEdGraphPin* IMP_GetExecInput(UEdGraphNode* N, FBPImportContext* Ctx)
 {
 	if (!N) return nullptr;
+	if (Ctx && Ctx->PendingExplicitExecInputPin
+		&& Ctx->PendingExplicitExecInputPin->GetOwningNode() == N)
+	{
+		UEdGraphPin* ExplicitPin = Ctx->PendingExplicitExecInputPin;
+		Ctx->PendingExplicitExecInputPin = nullptr;
+		return ExplicitPin;
+	}
 	for (UEdGraphPin* P : N->Pins)
 		if (P && P->Direction == EGPD_Input && P->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
 			return P;
@@ -4731,6 +5418,11 @@ static void IMP_ApplyCallInputs(UK2Node_CallFunction* CallNode, const FLispNodeP
 
 static void IMP_UpdateCurrentExecPin(UEdGraphNode* Node, UEdGraphPin* OutExecPin, UEdGraphPin*& CurrentExecPin)
 {
+	if (Cast<UK2Node_Timeline>(Node))
+	{
+		CurrentExecPin = nullptr;
+		return;
+	}
 	if (OutExecPin)
 	{
 		CurrentExecPin = OutExecPin;
@@ -5082,7 +5774,9 @@ static UEdGraphPin* IMP_FindImportedStableOutputPin(const FLispNodePtr& Form, UE
 {
 	const FString StableId = IMP_GetRequestedNodeStableId(Form);
 	if (StableId.IsEmpty()) return nullptr;
-	UEdGraphNode* ExistingNode = Ctx.TempIdToNode.FindRef(TEXT("_stable_") + StableId);
+	const FString StableKey = TEXT("_stable_") + StableId;
+	const bool bAlreadyImported = Ctx.TempIdToNode.Contains(StableKey);
+	UEdGraphNode* ExistingNode = Ctx.TempIdToNode.FindRef(StableKey);
 	if (!ExistingNode && Ctx.Graph)
 	{
 		for (UEdGraphNode* Candidate : Ctx.Graph->Nodes)
@@ -5090,12 +5784,25 @@ static UEdGraphPin* IMP_FindImportedStableOutputPin(const FLispNodePtr& Form, UE
 			if (Candidate && Candidate->NodeGuid.ToString(EGuidFormats::Digits).StartsWith(StableId, ESearchCase::IgnoreCase))
 			{
 				ExistingNode = Candidate;
-				Ctx.TempIdToNode.Add(TEXT("_stable_") + StableId, Candidate);
 				break;
 			}
 		}
 	}
 	if (!ExistingNode) return nullptr;
+	if (IMP_IsPendingReusableBodyNode(ExistingNode, Ctx))
+	{
+		if (!bAlreadyImported)
+		{
+			// Let the normal expression importer claim, reconstruct, and register
+			// a node that belongs to the active incremental reuse pool.
+			return nullptr;
+		}
+		Ctx.ConsumedReusableBodyGuids.Add(ExistingNode->NodeGuid);
+	}
+	else if (!bAlreadyImported)
+	{
+		Ctx.TempIdToNode.Add(StableKey, ExistingNode);
+	}
 
 	FString PreferredOutputName = IMP_GetKeywordAtomValue(Form, TEXT(":out-pin"));
 	if (PreferredOutputName.IsEmpty()) PreferredOutputName = IMP_GetKeywordAtomValue(Form, TEXT(":field"));
@@ -5273,7 +5980,7 @@ static UEdGraphPin* IMP_TryBuildSelectOutputPin(const FLispNodePtr& Expr, UEdGra
 	}
 
 	Ctx.TempIdToNode.Add(Ctx.GenerateTempId(), SelectNode);
-	IMP_ApplyRequestedStableId(SelectNode, Expr, false);
+	IMP_ApplyRequestedStableId(SelectNode, Expr, false, Ctx.ReusableBodyNodes.Contains(SelectNode));
 	IMP_RegisterImportedStableNode(SelectNode, Expr, Ctx);
 	Ctx.TempIdToNode.Add(SelectNode->NodeGuid.ToString(), SelectNode);
 	Ctx.AdvancePosition();
@@ -5470,7 +6177,7 @@ static UEdGraphPin* IMP_TryBuildBreakStructOutputPin(const FLispNodePtr& Expr, U
 	}
 
 	IMP_RegisterBoundValue(SelectedOutputPin->PinName.ToString(), SelectedOutputPin, Ctx);
-	IMP_ApplyRequestedStableId(BreakNode, Expr, false);
+	IMP_ApplyRequestedStableId(BreakNode, Expr, false, Ctx.ReusableBodyNodes.Contains(BreakNode));
 	IMP_RegisterImportedStableNode(BreakNode, Expr, Ctx);
 	Ctx.TempIdToNode.FindOrAdd(BreakNode->NodeGuid.ToString()) = BreakNode;
 	return SelectedOutputPin;
@@ -5488,6 +6195,7 @@ static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPIm
 	}
 	if (Expr->IsNil())
 	{
+		Pin->BreakAllPinLinks();
 		if (const UEdGraphSchema* Schema = Ctx.Graph ? Ctx.Graph->GetSchema() : nullptr)
 		{
 			Schema->ResetPinToAutogeneratedDefaultValue(Pin, false);
@@ -5579,12 +6287,13 @@ static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPIm
 	{
 		UObject* Asset = StaticLoadObject(UObject::StaticClass(), nullptr, *Ctx.LastAssetPath);
 		Ctx.LastAssetPath.Empty();
-		if (Asset) { Pin->DefaultObject = Asset; return true; }
+		if (Asset) { Pin->BreakAllPinLinks(); Pin->DefaultObject = Asset; return true; }
 	}
 
 
 	if (Expr->IsNumber())
 	{
+		Pin->BreakAllPinLinks();
 		const FName PinCategory = Pin->PinType.PinCategory;
 		if (PinCategory == UEdGraphSchema_K2::PC_Int || PinCategory == UEdGraphSchema_K2::PC_Int64 || PinCategory == UEdGraphSchema_K2::PC_Byte)
 		{
@@ -5592,22 +6301,23 @@ static bool IMP_SetPinFromExpr(UEdGraphPin* Pin, const FLispNodePtr& Expr, FBPIm
 		}
 		else
 		{
-			Pin->DefaultValue = FString::SanitizeFloat(Expr->NumberValue);
+			Pin->DefaultValue = BP_NumberToRoundTripString(Expr->NumberValue);
 		}
 		return true;
 	}
 
-	if (Expr->IsString())       { Pin->DefaultValue = Expr->StringValue; return true; }
+	if (Expr->IsString())       { Pin->BreakAllPinLinks(); Pin->DefaultValue = Expr->StringValue; return true; }
 	if (Expr->IsSymbol())
 	{
 		FString S = Expr->StringValue;
-		if (S.Equals(TEXT("true"),  ESearchCase::IgnoreCase)) { Pin->DefaultValue = TEXT("true");  return true; }
-		if (S.Equals(TEXT("false"), ESearchCase::IgnoreCase)) { Pin->DefaultValue = TEXT("false"); return true; }
-		if (S.Equals(TEXT("nil"),   ESearchCase::IgnoreCase)) { Pin->DefaultValue = TEXT("");      return true; }
+		if (S.Equals(TEXT("true"),  ESearchCase::IgnoreCase)) { Pin->BreakAllPinLinks(); Pin->DefaultValue = TEXT("true");  return true; }
+		if (S.Equals(TEXT("false"), ESearchCase::IgnoreCase)) { Pin->BreakAllPinLinks(); Pin->DefaultValue = TEXT("false"); return true; }
+		if (S.Equals(TEXT("nil"),   ESearchCase::IgnoreCase)) { Pin->BreakAllPinLinks(); Pin->DefaultValue = TEXT("");      return true; }
 
 		const FName PinCategory = Pin->PinType.PinCategory;
 		if (PinCategory == UEdGraphSchema_K2::PC_String || PinCategory == UEdGraphSchema_K2::PC_Name || PinCategory == UEdGraphSchema_K2::PC_Text)
 		{
+			Pin->BreakAllPinLinks();
 			Pin->DefaultValue = S;
 			return true;
 		}
@@ -6865,6 +7575,1461 @@ static bool IMP_TryParseBoolLiteral(const FLispNodePtr& Node, bool& OutValue)
 	return false;
 }
 
+static bool IMP_QueueExecReference(
+	const FLispNodePtr& Form,
+	FBPImportContext& Ctx,
+	UEdGraphPin*& CurrentExecPin)
+{
+	if (!Form.IsValid() || !Form->IsForm(TEXT("exec-ref"))) return false;
+	const FString StableId = IMP_GetKeywordAtomValue(Form, TEXT(":id")).ToLower();
+	if (StableId.IsEmpty())
+	{
+		Ctx.Errors.Add(TEXT("IMP: exec-ref requires :id"));
+	}
+	else if (!CurrentExecPin)
+	{
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: exec-ref '%s' has no source execution pin"), *StableId));
+	}
+	else
+	{
+		FBPImportContext::FPendingExecReference& Pending = Ctx.PendingExecReferences.AddDefaulted_GetRef();
+		Pending.SourcePin = CurrentExecPin;
+		Pending.StableId = StableId;
+		Pending.ExecInputName = IMP_GetKeywordAtomValue(Form, TEXT(":exec-in"));
+	}
+	CurrentExecPin = nullptr;
+	return true;
+}
+
+static bool IMP_ResolvePendingExecReferences(FBPImportContext& Ctx)
+{
+	for (const FBPImportContext::FPendingExecReference& Pending : Ctx.PendingExecReferences)
+	{
+		UEdGraphNode* TargetNode = Ctx.TempIdToNode.FindRef(TEXT("_stable_") + Pending.StableId);
+		if (!TargetNode && Ctx.Graph)
+		{
+			for (UEdGraphNode* Candidate : Ctx.Graph->Nodes)
+			{
+				if (Candidate && Candidate->NodeGuid.ToString(EGuidFormats::Digits).StartsWith(
+					Pending.StableId, ESearchCase::IgnoreCase))
+				{
+					TargetNode = Candidate;
+					break;
+				}
+			}
+		}
+		if (!TargetNode)
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: exec-ref target '%s' was not imported"), *Pending.StableId));
+			continue;
+		}
+
+		UEdGraphPin* TargetPin = Pending.ExecInputName.IsEmpty()
+			? IMP_GetExecInput(TargetNode)
+			: TargetNode->FindPin(FName(*Pending.ExecInputName), EGPD_Input);
+		if (!TargetPin || TargetPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: exec-ref target '%s' has no exec input '%s'"),
+				*Pending.StableId, *Pending.ExecInputName));
+			continue;
+		}
+		IMP_Connect(Pending.SourcePin, TargetPin, Ctx);
+	}
+	Ctx.PendingExecReferences.Reset();
+	return Ctx.Errors.Num() == 0;
+}
+
+static bool IMP_TryParseNumberLiteral(const FLispNodePtr& Node, float& OutValue)
+{
+	if (!Node.IsValid() || !Node->IsNumber()) return false;
+	OutValue = static_cast<float>(Node->NumberValue);
+	return FMath::IsFinite(OutValue);
+}
+
+static bool IMP_ParseRichCurveInterpMode(const FString& Value, ERichCurveInterpMode& OutMode)
+{
+	if (Value.Equals(TEXT("linear"), ESearchCase::IgnoreCase)) { OutMode = RCIM_Linear; return true; }
+	if (Value.Equals(TEXT("constant"), ESearchCase::IgnoreCase)) { OutMode = RCIM_Constant; return true; }
+	if (Value.Equals(TEXT("cubic"), ESearchCase::IgnoreCase)) { OutMode = RCIM_Cubic; return true; }
+	if (Value.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { OutMode = RCIM_None; return true; }
+	return false;
+}
+
+static bool IMP_ParseRichCurveTangentMode(const FString& Value, ERichCurveTangentMode& OutMode)
+{
+	if (Value.Equals(TEXT("auto"), ESearchCase::IgnoreCase)) { OutMode = RCTM_Auto; return true; }
+	if (Value.Equals(TEXT("user"), ESearchCase::IgnoreCase)) { OutMode = RCTM_User; return true; }
+	if (Value.Equals(TEXT("break"), ESearchCase::IgnoreCase)) { OutMode = RCTM_Break; return true; }
+#if ENGINE_MAJOR_VERSION > 5 || (ENGINE_MAJOR_VERSION == 5 && ENGINE_MINOR_VERSION >= 3)
+	if (Value.Equals(TEXT("smart-auto"), ESearchCase::IgnoreCase)) { OutMode = RCTM_SmartAuto; return true; }
+#endif
+	if (Value.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { OutMode = RCTM_None; return true; }
+	return false;
+}
+
+static bool IMP_ParseRichCurveTangentWeightMode(const FString& Value, ERichCurveTangentWeightMode& OutMode)
+{
+	if (Value.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { OutMode = RCTWM_WeightedNone; return true; }
+	if (Value.Equals(TEXT("arrive"), ESearchCase::IgnoreCase)) { OutMode = RCTWM_WeightedArrive; return true; }
+	if (Value.Equals(TEXT("leave"), ESearchCase::IgnoreCase)) { OutMode = RCTWM_WeightedLeave; return true; }
+	if (Value.Equals(TEXT("both"), ESearchCase::IgnoreCase)) { OutMode = RCTWM_WeightedBoth; return true; }
+	return false;
+}
+
+static bool IMP_ParseRichCurveExtrapolation(const FString& Value, ERichCurveExtrapolation& OutMode)
+{
+	if (Value.Equals(TEXT("cycle"), ESearchCase::IgnoreCase)) { OutMode = RCCE_Cycle; return true; }
+	if (Value.Equals(TEXT("cycle-with-offset"), ESearchCase::IgnoreCase)) { OutMode = RCCE_CycleWithOffset; return true; }
+	if (Value.Equals(TEXT("oscillate"), ESearchCase::IgnoreCase)) { OutMode = RCCE_Oscillate; return true; }
+	if (Value.Equals(TEXT("linear"), ESearchCase::IgnoreCase)) { OutMode = RCCE_Linear; return true; }
+	if (Value.Equals(TEXT("constant"), ESearchCase::IgnoreCase)) { OutMode = RCCE_Constant; return true; }
+	if (Value.Equals(TEXT("none"), ESearchCase::IgnoreCase)) { OutMode = RCCE_None; return true; }
+	return false;
+}
+
+static bool IMP_ParseRichCurve(const FLispNodePtr& Form, FRichCurve& OutCurve, const FString& Context, FBPImportContext& Ctx)
+{
+	if (!Form.IsValid() || !Form->IsForm(TEXT("rich-curve")))
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s requires a (rich-curve ...) value"), *Context));
+		return false;
+	}
+
+	OutCurve.Reset();
+	OutCurve.ClearDefaultValue();
+	OutCurve.PreInfinityExtrap = RCCE_Constant;
+	OutCurve.PostInfinityExtrap = RCCE_Constant;
+	if (Form->HasKeyword(TEXT(":default")))
+	{
+		float DefaultValue = 0.0f;
+		if (!IMP_TryParseNumberLiteral(Form->GetKeywordArg(TEXT(":default")), DefaultValue))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s :default must be a finite number"), *Context));
+			return false;
+		}
+		OutCurve.SetDefaultValue(DefaultValue);
+	}
+
+	if (Form->HasKeyword(TEXT(":pre-extrap")))
+	{
+		ERichCurveExtrapolation ParsedMode = RCCE_Constant;
+		if (!IMP_ParseRichCurveExtrapolation(IMP_GetAtomName(Form->GetKeywordArg(TEXT(":pre-extrap"))), ParsedMode))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s has an invalid :pre-extrap value"), *Context));
+			return false;
+		}
+		OutCurve.PreInfinityExtrap = ParsedMode;
+	}
+	if (Form->HasKeyword(TEXT(":post-extrap")))
+	{
+		ERichCurveExtrapolation ParsedMode = RCCE_Constant;
+		if (!IMP_ParseRichCurveExtrapolation(IMP_GetAtomName(Form->GetKeywordArg(TEXT(":post-extrap"))), ParsedMode))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s has an invalid :post-extrap value"), *Context));
+			return false;
+		}
+		OutCurve.PostInfinityExtrap = ParsedMode;
+	}
+
+	TArray<FRichCurveKey> Keys;
+	for (int32 Index = 1; Index + 1 < Form->Num(); ++Index)
+	{
+		const FLispNodePtr Keyword = Form->Get(Index);
+		if (!Keyword.IsValid() || !Keyword->IsKeyword()
+			|| !Keyword->StringValue.Equals(TEXT(":key"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
+		const FLispNodePtr KeyForm = Form->Get(++Index);
+		if (!KeyForm.IsValid() || !KeyForm->IsForm(TEXT("key")))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s :key must contain a (key ...) form"), *Context));
+			return false;
+		}
+
+		FRichCurveKey Key;
+		if (!IMP_TryParseNumberLiteral(KeyForm->GetKeywordArg(TEXT(":time")), Key.Time)
+			|| !IMP_TryParseNumberLiteral(KeyForm->GetKeywordArg(TEXT(":value")), Key.Value))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s key requires finite :time and :value numbers"), *Context));
+			return false;
+		}
+
+		if (KeyForm->HasKeyword(TEXT(":interp")))
+		{
+			ERichCurveInterpMode ParsedMode = RCIM_Linear;
+			if (!IMP_ParseRichCurveInterpMode(IMP_GetAtomName(KeyForm->GetKeywordArg(TEXT(":interp"))), ParsedMode))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s key has an invalid :interp value"), *Context));
+				return false;
+			}
+			Key.InterpMode = ParsedMode;
+		}
+		if (KeyForm->HasKeyword(TEXT(":tangent")))
+		{
+			ERichCurveTangentMode ParsedMode = RCTM_Auto;
+			if (!IMP_ParseRichCurveTangentMode(IMP_GetAtomName(KeyForm->GetKeywordArg(TEXT(":tangent"))), ParsedMode))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s key has an invalid :tangent value"), *Context));
+				return false;
+			}
+			Key.TangentMode = ParsedMode;
+		}
+		if (KeyForm->HasKeyword(TEXT(":weight")))
+		{
+			ERichCurveTangentWeightMode ParsedMode = RCTWM_WeightedNone;
+			if (!IMP_ParseRichCurveTangentWeightMode(IMP_GetAtomName(KeyForm->GetKeywordArg(TEXT(":weight"))), ParsedMode))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s key has an invalid :weight value"), *Context));
+				return false;
+			}
+			Key.TangentWeightMode = ParsedMode;
+		}
+
+		auto ParseOptionalNumber = [&KeyForm, &Context, &Ctx](const TCHAR* KeywordName, float& Destination) -> bool
+		{
+			if (!KeyForm->HasKeyword(KeywordName)) return true;
+			if (IMP_TryParseNumberLiteral(KeyForm->GetKeywordArg(KeywordName), Destination)) return true;
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s key %s must be a finite number"), *Context, KeywordName));
+			return false;
+		};
+		if (!ParseOptionalNumber(TEXT(":arrive"), Key.ArriveTangent)
+			|| !ParseOptionalNumber(TEXT(":leave"), Key.LeaveTangent)
+			|| !ParseOptionalNumber(TEXT(":arrive-weight"), Key.ArriveTangentWeight)
+			|| !ParseOptionalNumber(TEXT(":leave-weight"), Key.LeaveTangentWeight))
+		{
+			return false;
+		}
+		Keys.Add(Key);
+	}
+	Keys.StableSort([](const FRichCurveKey& A, const FRichCurveKey& B) { return A.Time < B.Time; });
+	OutCurve.SetKeys(Keys);
+	return true;
+}
+
+template <typename CurveType>
+static CurveType* IMP_NewInternalTimelineCurve(FBPImportContext& Ctx, const FString& TimelineName, const FString& TrackName)
+{
+	if (!Ctx.Blueprint || !Ctx.Blueprint->GeneratedClass)
+	{
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: Timeline '%s' cannot create track '%s' because GeneratedClass is null"),
+			*TimelineName, *TrackName));
+		return nullptr;
+	}
+	return NewObject<CurveType>(Ctx.Blueprint->GeneratedClass, NAME_None, RF_Public | RF_Transactional);
+}
+
+template <typename CurveType>
+static CurveType* IMP_LoadExternalTimelineCurve(const FLispNodePtr& CurveForm, const FString& Context, FBPImportContext& Ctx)
+{
+	if (!CurveForm.IsValid() || !CurveForm->IsForm(TEXT("asset")) || CurveForm->Num() < 2)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s external curve requires (asset \"/Path/Curve\")"), *Context));
+		return nullptr;
+	}
+	const FString AssetPath = IMP_GetAtomName(CurveForm->Get(1));
+	CurveType* Curve = LoadObject<CurveType>(nullptr, *AssetPath);
+	if (!Curve)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s could not load curve asset '%s'"), *Context, *AssetPath));
+	}
+	return Curve;
+}
+
+static bool IMP_ReadOptionalTimelineBool(const FLispNodePtr& Form, const TCHAR* Keyword, bool DefaultValue, bool& OutValue, const FString& Context, FBPImportContext& Ctx)
+{
+	OutValue = DefaultValue;
+	if (!Form->HasKeyword(Keyword)) return true;
+	if (IMP_TryParseBoolLiteral(Form->GetKeywordArg(Keyword), OutValue)) return true;
+	Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s %s must be true or false"), *Context, Keyword));
+	return false;
+}
+
+static bool IMP_ApplyTimelineTrackState(const FLispNodePtr& TrackForm, FTTTrackBase& Track, const FString& Context, FBPImportContext& Ctx)
+{
+	bool bExternal = false;
+	bool bExpanded = true;
+	bool bSynchronized = true;
+	if (!IMP_ReadOptionalTimelineBool(TrackForm, TEXT(":external"), false, bExternal, Context, Ctx)) return false;
+	Track.bIsExternalCurve = bExternal;
+#if WITH_EDITORONLY_DATA
+	if (!IMP_ReadOptionalTimelineBool(TrackForm, TEXT(":expanded"), true, bExpanded, Context, Ctx)
+		|| !IMP_ReadOptionalTimelineBool(TrackForm, TEXT(":curve-view-synchronized"), true, bSynchronized, Context, Ctx))
+	{
+		return false;
+	}
+	Track.bIsExpanded = bExpanded;
+	Track.bIsCurveViewSynchronized = bSynchronized;
+#endif
+	return true;
+}
+
+static bool IMP_AddTimelineTrack(const FLispNodePtr& TrackForm, UTimelineTemplate* Template, const FString& TimelineName, FBPImportContext& Ctx)
+{
+	if (!TrackForm.IsValid() || !TrackForm->IsList() || TrackForm->Num() < 2)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has an invalid :track form"), *TimelineName));
+		return false;
+	}
+	const FString TrackType = IMP_GetAtomName(TrackForm->Get(0)).ToLower();
+	const FString TrackName = IMP_GetAtomName(TrackForm->Get(1));
+	const FString Context = FString::Printf(TEXT("Timeline '%s' track '%s'"), *TimelineName, *TrackName);
+	if (TrackName.IsEmpty() || !Template->IsNewTrackNameValid(FName(*TrackName)))
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s has an empty or duplicate track name"), *Context));
+		return false;
+	}
+	const FLispNodePtr CurveForm = TrackForm->GetKeywordArg(TEXT(":curve"));
+	bool bExternal = false;
+	if (!IMP_ReadOptionalTimelineBool(TrackForm, TEXT(":external"), CurveForm.IsValid() && CurveForm->IsForm(TEXT("asset")), bExternal, Context, Ctx))
+	{
+		return false;
+	}
+
+	if (TrackType == TEXT("event") || TrackType == TEXT("float"))
+	{
+		UCurveFloat* Curve = nullptr;
+		if (bExternal)
+		{
+			Curve = IMP_LoadExternalTimelineCurve<UCurveFloat>(CurveForm, Context, Ctx);
+		}
+		else
+		{
+			Curve = IMP_NewInternalTimelineCurve<UCurveFloat>(Ctx, TimelineName, TrackName);
+			if (Curve && !IMP_ParseRichCurve(CurveForm, Curve->FloatCurve, Context, Ctx)) return false;
+			if (Curve && TrackType == TEXT("event")) Curve->bIsEventCurve = true;
+		}
+		if (!Curve) return false;
+
+		if (TrackType == TEXT("event"))
+		{
+			FTTEventTrack Track;
+			Track.SetTrackName(FName(*TrackName), Template);
+			if (!IMP_ApplyTimelineTrackState(TrackForm, Track, Context, Ctx)) return false;
+			Track.bIsExternalCurve = bExternal;
+			Track.CurveKeys = Curve;
+			const int32 TrackIndex = Template->EventTracks.Add(Track);
+			Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_Event, TrackIndex));
+		}
+		else
+		{
+			FTTFloatTrack Track;
+			Track.SetTrackName(FName(*TrackName), Template);
+			if (!IMP_ApplyTimelineTrackState(TrackForm, Track, Context, Ctx)) return false;
+			Track.bIsExternalCurve = bExternal;
+			Track.CurveFloat = Curve;
+			const int32 TrackIndex = Template->FloatTracks.Add(Track);
+			Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_FloatInterp, TrackIndex));
+		}
+		return true;
+	}
+
+	if (TrackType == TEXT("vector"))
+	{
+		UCurveVector* Curve = bExternal ? IMP_LoadExternalTimelineCurve<UCurveVector>(CurveForm, Context, Ctx)
+			: IMP_NewInternalTimelineCurve<UCurveVector>(Ctx, TimelineName, TrackName);
+		if (!Curve) return false;
+		if (!bExternal)
+		{
+			if (!CurveForm.IsValid() || !CurveForm->IsForm(TEXT("vector-curve")))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s requires a (vector-curve ...) value"), *Context));
+				return false;
+			}
+			if (!IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":x")), Curve->FloatCurves[0], Context + TEXT(" X"), Ctx)
+				|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":y")), Curve->FloatCurves[1], Context + TEXT(" Y"), Ctx)
+				|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":z")), Curve->FloatCurves[2], Context + TEXT(" Z"), Ctx)) return false;
+		}
+		FTTVectorTrack Track;
+		Track.SetTrackName(FName(*TrackName), Template);
+		if (!IMP_ApplyTimelineTrackState(TrackForm, Track, Context, Ctx)) return false;
+		Track.bIsExternalCurve = bExternal;
+		Track.CurveVector = Curve;
+		const int32 TrackIndex = Template->VectorTracks.Add(Track);
+		Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_VectorInterp, TrackIndex));
+		return true;
+	}
+
+	if (TrackType == TEXT("linear-color"))
+	{
+		UCurveLinearColor* Curve = bExternal ? IMP_LoadExternalTimelineCurve<UCurveLinearColor>(CurveForm, Context, Ctx)
+			: IMP_NewInternalTimelineCurve<UCurveLinearColor>(Ctx, TimelineName, TrackName);
+		if (!Curve) return false;
+		if (!bExternal)
+		{
+			if (!CurveForm.IsValid() || !CurveForm->IsForm(TEXT("linear-color-curve")))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s requires a (linear-color-curve ...) value"), *Context));
+				return false;
+			}
+			if (!IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":r")), Curve->FloatCurves[0], Context + TEXT(" R"), Ctx)
+				|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":g")), Curve->FloatCurves[1], Context + TEXT(" G"), Ctx)
+				|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":b")), Curve->FloatCurves[2], Context + TEXT(" B"), Ctx)
+				|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":a")), Curve->FloatCurves[3], Context + TEXT(" A"), Ctx)) return false;
+
+			auto ParseAdjustment = [&CurveForm, &Context, &Ctx](const TCHAR* Keyword, float& Destination) -> bool
+			{
+				if (!CurveForm->HasKeyword(Keyword)) return true;
+				if (IMP_TryParseNumberLiteral(CurveForm->GetKeywordArg(Keyword), Destination)) return true;
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s %s must be a finite number"), *Context, Keyword));
+				return false;
+			};
+			if (!ParseAdjustment(TEXT(":adjust-hue"), Curve->AdjustHue)
+				|| !ParseAdjustment(TEXT(":adjust-saturation"), Curve->AdjustSaturation)
+				|| !ParseAdjustment(TEXT(":adjust-brightness"), Curve->AdjustBrightness)
+				|| !ParseAdjustment(TEXT(":adjust-brightness-curve"), Curve->AdjustBrightnessCurve)
+				|| !ParseAdjustment(TEXT(":adjust-vibrance"), Curve->AdjustVibrance)
+				|| !ParseAdjustment(TEXT(":adjust-min-alpha"), Curve->AdjustMinAlpha)
+				|| !ParseAdjustment(TEXT(":adjust-max-alpha"), Curve->AdjustMaxAlpha)) return false;
+		}
+		FTTLinearColorTrack Track;
+		Track.SetTrackName(FName(*TrackName), Template);
+		if (!IMP_ApplyTimelineTrackState(TrackForm, Track, Context, Ctx)) return false;
+		Track.bIsExternalCurve = bExternal;
+		Track.CurveLinearColor = Curve;
+		const int32 TrackIndex = Template->LinearColorTracks.Add(Track);
+		Template->AddDisplayTrack(FTTTrackId(FTTTrackBase::TT_LinearColorInterp, TrackIndex));
+		return true;
+	}
+
+	Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s uses unknown track type '%s'"), *Context, *TrackType));
+	return false;
+}
+
+static bool IMP_PreflightTimelineTrack(
+	const FLispNodePtr& TrackForm,
+	const FString& TimelineName,
+	TSet<FString>& TrackNames,
+	TSet<FString>& EventTrackNames,
+	FBPImportContext& Ctx)
+{
+	if (!TrackForm.IsValid() || !TrackForm->IsList() || TrackForm->Num() < 2)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has an invalid :track form"), *TimelineName));
+		return false;
+	}
+	const FString TrackType = IMP_GetAtomName(TrackForm->Get(0)).ToLower();
+	const FString TrackName = IMP_GetAtomName(TrackForm->Get(1));
+	const FString NormalizedTrackName = TrackName.ToLower();
+	const FString Context = FString::Printf(TEXT("Timeline '%s' track '%s'"), *TimelineName, *TrackName);
+	if (TrackName.IsEmpty() || TrackNames.Contains(NormalizedTrackName)
+		|| BP_IsTimelineReservedPinName(TrackName))
+	{
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: %s has an empty, duplicate, or reserved track name"), *Context));
+		return false;
+	}
+	TrackNames.Add(NormalizedTrackName);
+
+	const FLispNodePtr CurveForm = TrackForm->GetKeywordArg(TEXT(":curve"));
+	bool bExternal = false;
+	if (!IMP_ReadOptionalTimelineBool(
+		TrackForm, TEXT(":external"), CurveForm.IsValid() && CurveForm->IsForm(TEXT("asset")),
+		bExternal, Context, Ctx)) return false;
+	FTTFloatTrack TrackState;
+	if (!IMP_ApplyTimelineTrackState(TrackForm, TrackState, Context, Ctx)) return false;
+
+	if (TrackType == TEXT("event") || TrackType == TEXT("float"))
+	{
+		if (bExternal)
+		{
+			if (!IMP_LoadExternalTimelineCurve<UCurveFloat>(CurveForm, Context, Ctx)) return false;
+		}
+		else
+		{
+			FRichCurve Curve;
+			if (!IMP_ParseRichCurve(CurveForm, Curve, Context, Ctx)) return false;
+		}
+		if (TrackType == TEXT("event")) EventTrackNames.Add(NormalizedTrackName);
+		return true;
+	}
+
+	if (TrackType == TEXT("vector"))
+	{
+		if (bExternal)
+		{
+			return IMP_LoadExternalTimelineCurve<UCurveVector>(CurveForm, Context, Ctx) != nullptr;
+		}
+		if (!CurveForm.IsValid() || !CurveForm->IsForm(TEXT("vector-curve")))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s requires a (vector-curve ...) value"), *Context));
+			return false;
+		}
+		FRichCurve X, Y, Z;
+		return IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":x")), X, Context + TEXT(" X"), Ctx)
+			&& IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":y")), Y, Context + TEXT(" Y"), Ctx)
+			&& IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":z")), Z, Context + TEXT(" Z"), Ctx);
+	}
+
+	if (TrackType == TEXT("linear-color"))
+	{
+		if (bExternal)
+		{
+			return IMP_LoadExternalTimelineCurve<UCurveLinearColor>(CurveForm, Context, Ctx) != nullptr;
+		}
+		if (!CurveForm.IsValid() || !CurveForm->IsForm(TEXT("linear-color-curve")))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s requires a (linear-color-curve ...) value"), *Context));
+			return false;
+		}
+		FRichCurve R, G, B, A;
+		if (!IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":r")), R, Context + TEXT(" R"), Ctx)
+			|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":g")), G, Context + TEXT(" G"), Ctx)
+			|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":b")), B, Context + TEXT(" B"), Ctx)
+			|| !IMP_ParseRichCurve(CurveForm->GetKeywordArg(TEXT(":a")), A, Context + TEXT(" A"), Ctx)) return false;
+		for (const TCHAR* Keyword : {
+			TEXT(":adjust-hue"), TEXT(":adjust-saturation"), TEXT(":adjust-brightness"),
+			TEXT(":adjust-brightness-curve"), TEXT(":adjust-vibrance"),
+			TEXT(":adjust-min-alpha"), TEXT(":adjust-max-alpha") })
+		{
+			float Value = 0.0f;
+			if (CurveForm->HasKeyword(Keyword)
+				&& !IMP_TryParseNumberLiteral(CurveForm->GetKeywordArg(Keyword), Value))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s %s must be a finite number"), *Context, Keyword));
+				return false;
+			}
+		}
+		return true;
+	}
+
+	Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s uses unknown track type '%s'"), *Context, *TrackType));
+	return false;
+}
+
+static UK2Node_Timeline* IMP_FindTimelineNodeInGraph(UEdGraph* Graph, FName TimelineName);
+
+static bool IMP_PreflightTimelineExecBody(
+	const FLispNodePtr& Body,
+	const FString& Context,
+	const FString& OwningTimelineName,
+	FBPImportContext& Ctx)
+{
+	if (!Body.IsValid() || Body->IsNil()) return true;
+	if (!Body->IsList() || Body->Num() == 0)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s must be an executable form"), *Context));
+		return false;
+	}
+
+	const FString FormName = Body->GetFormName().ToLower();
+	if (FormName == TEXT("exec-ref"))
+	{
+		if (IMP_GetKeywordAtomValue(Body, TEXT(":id")).IsEmpty())
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s exec-ref requires :id"), *Context));
+			return false;
+		}
+		return true;
+	}
+	if (FormName == TEXT("seq"))
+	{
+		for (int32 Index = 1; Index < Body->Num(); ++Index)
+		{
+			const FLispNodePtr Part = Body->Get(Index);
+			if (Part.IsValid() && Part->IsKeyword())
+			{
+				++Index;
+				continue;
+			}
+			if (!IMP_PreflightTimelineExecBody(
+				Part, Context + TEXT(" seq"), OwningTimelineName, Ctx)) return false;
+		}
+		return true;
+	}
+	if (FormName == TEXT("branch"))
+	{
+		return IMP_PreflightTimelineExecBody(
+				Body->GetKeywordArg(TEXT(":true")), Context + TEXT(" true"), OwningTimelineName, Ctx)
+			&& IMP_PreflightTimelineExecBody(
+				Body->GetKeywordArg(TEXT(":false")), Context + TEXT(" false"), OwningTimelineName, Ctx);
+	}
+	if (FormName == TEXT("cast"))
+	{
+		const FString TargetClassName = Body->Num() >= 2 ? IMP_GetAtomName(Body->Get(1)) : FString();
+		if (Body->Num() < 3 || TargetClassName.IsEmpty()
+			|| !IMP_FindClassByName(TargetClassName, Ctx))
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: %s has a malformed cast or unknown target class '%s'"),
+				*Context, *TargetClassName));
+			return false;
+		}
+		const FLispNodePtr SuccessBody = Body->Num() >= 4 && !Body->Get(3)->IsKeyword()
+			? Body->Get(3) : FLispNode::MakeNil();
+		return IMP_PreflightTimelineExecBody(
+				SuccessBody, Context + TEXT(" cast-success"), OwningTimelineName, Ctx)
+			&& IMP_PreflightTimelineExecBody(
+				Body->GetKeywordArg(TEXT(":fail")), Context + TEXT(" cast-fail"), OwningTimelineName, Ctx);
+	}
+	if (FormName == TEXT("switch-int") || FormName == TEXT("switch-string")
+		|| FormName == TEXT("switch-enum"))
+	{
+		const int32 BodyStartIndex = FormName == TEXT("switch-enum") ? 3 : 2;
+		if (Body->Num() < BodyStartIndex)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s has a malformed %s"), *Context, *FormName));
+			return false;
+		}
+		if (FormName == TEXT("switch-enum")
+			&& !IMP_FindEnumByName(IMP_GetAtomName(Body->Get(1))))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s references an unknown enum"), *Context));
+			return false;
+		}
+		for (int32 Index = BodyStartIndex; Index + 1 < Body->Num(); ++Index)
+		{
+			const FLispNodePtr Keyword = Body->Get(Index);
+			if (!Keyword.IsValid() || !Keyword->IsKeyword()) continue;
+			const FString KeywordName = Keyword->StringValue.ToLower();
+			const FLispNodePtr Value = Body->Get(++Index);
+			if (KeywordName == TEXT(":id") || KeywordName == TEXT(":pos")
+				|| KeywordName == TEXT(":case-sensitive")) continue;
+			const FLispNodePtr CaseBody = KeywordName == TEXT(":case")
+				&& Value.IsValid() && Value->IsList() && Value->Num() >= 2
+				? Value->Get(1) : Value;
+			if (!IMP_PreflightTimelineExecBody(
+				CaseBody, Context + TEXT(" ") + FormName + TEXT(" case"), OwningTimelineName, Ctx)) return false;
+		}
+		return true;
+	}
+	if (FormName == TEXT("return") || FormName == TEXT("exit"))
+	{
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: %s cannot use '%s' in a Timeline callback"), *Context, *FormName));
+		return false;
+	}
+	if (FormName == TEXT("call"))
+	{
+		if (Body->Num() < 3 || !Body->Get(2).IsValid() || !Body->Get(2)->IsSymbol())
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s has a malformed call"), *Context));
+			return false;
+		}
+		const FString FunctionName = IMP_GetAtomName(Body->Get(2));
+		UFunction* Function = IMP_FindFunctionForForm(FunctionName, Body, Ctx);
+		bool bBlueprintFunctionGraph = false;
+		if (!Function && Ctx.Blueprint)
+		{
+			for (UEdGraph* FunctionGraph : Ctx.Blueprint->FunctionGraphs)
+			{
+				if (FunctionGraph && FunctionGraph->GetFName() == FName(*FunctionName))
+				{
+					bBlueprintFunctionGraph = true;
+					break;
+				}
+			}
+		}
+		if ((!Function && !bBlueprintFunctionGraph)
+			|| (Function && Function->HasAnyFunctionFlags(FUNC_BlueprintPure)))
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: %s call target '%s' is missing or pure and cannot drive a Timeline callback"),
+				*Context, *FunctionName));
+			return false;
+		}
+		return true;
+	}
+	if (FormName == TEXT("call-parent"))
+	{
+		int32 ArgStartIndex = 2;
+		const FString FunctionName = IMP_ExtractCompoundName(Body, 1, ArgStartIndex);
+		UFunction* Function = IMP_FindParentFunction(FunctionName, Ctx);
+		if (!Function || Function->HasAnyFunctionFlags(FUNC_BlueprintPure))
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: %s parent call target '%s' is missing or pure"), *Context, *FunctionName));
+			return false;
+		}
+		return true;
+	}
+	if (FormName == TEXT("call-macro"))
+	{
+		int32 ArgStartIndex = 2;
+		const FString MacroName = IMP_ExtractCallMacroName(Body, ArgStartIndex);
+		UEdGraph* MacroGraph = IMP_FindMacroGraphByName(MacroName, Ctx);
+		bool bHasExecEntry = false;
+		if (MacroGraph)
+		{
+			for (UEdGraphNode* Node : MacroGraph->Nodes)
+			{
+				const UK2Node_Tunnel* Tunnel = Cast<UK2Node_Tunnel>(Node);
+				if (!Tunnel || !Tunnel->DrawNodeAsEntry()) continue;
+				for (UEdGraphPin* Pin : Tunnel->Pins)
+				{
+					if (Pin && Pin->Direction == EGPD_Output
+						&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+					{
+						bHasExecEntry = true;
+						break;
+					}
+				}
+				if (bHasExecEntry) break;
+			}
+		}
+		if (!bHasExecEntry)
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: %s macro '%s' is missing or has no execution input"), *Context, *MacroName));
+			return false;
+		}
+		return true;
+	}
+
+	static const TSet<FString> KnownExecForms = {
+		TEXT("timeline-control"), TEXT("create-object"), TEXT("evaluate-chooser"),
+		TEXT("set-struct-fields"), TEXT("set"), TEXT("let"),
+	};
+	if (FormName == TEXT("set-local"))
+	{
+		Ctx.Errors.Add(FString::Printf(
+			TEXT("IMP: %s cannot use set-local outside a function graph"), *Context));
+		return false;
+	}
+	if (KnownExecForms.Contains(FormName))
+	{
+		if (FormName == TEXT("create-object"))
+		{
+			const FString ClassPath = IMP_GetAtomName(Body->GetKeywordArg(TEXT(":class")));
+			if (!IMP_FindClassByName(ClassPath, Ctx))
+			{
+				Ctx.Errors.Add(FString::Printf(
+					TEXT("IMP: %s create-object class not found: %s"), *Context, *ClassPath));
+				return false;
+			}
+		}
+		return true;
+	}
+	if (!FormName.IsEmpty())
+	{
+		if (UFunction* Function = IMP_FindFunctionForForm(FormName, Body, Ctx))
+		{
+			if (!Function->HasAnyFunctionFlags(FUNC_BlueprintPure)) return true;
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: %s shorthand call '%s' is pure and cannot drive a Timeline callback"),
+				*Context, *FormName));
+			return false;
+		}
+	}
+
+	if (Ctx.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		const FString StableId = IMP_GetRequestedNodeStableId(Body);
+		if (!StableId.IsEmpty() && Ctx.Graph)
+		{
+			TSet<UEdGraphNode*> TimelineCallbackNodes;
+			UK2Node_Timeline* TimelineNode = IMP_FindTimelineNodeInGraph(
+				Ctx.Graph, FName(*OwningTimelineName));
+			if (TimelineNode)
+			{
+				for (UEdGraphPin* Pin : TimelineNode->Pins)
+				{
+					if (Pin && Pin->Direction == EGPD_Output
+						&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+					{
+						IMP_CollectDownstreamExecNodes(Pin, TimelineCallbackNodes);
+					}
+				}
+			}
+			for (UEdGraphNode* Node : TimelineCallbackNodes)
+			{
+				if (Node && Node->NodeGuid.ToString(EGuidFormats::Digits).StartsWith(
+					StableId, ESearchCase::IgnoreCase)) return true;
+			}
+		}
+	}
+
+	Ctx.Errors.Add(FString::Printf(
+		TEXT("IMP: %s contains unsupported executable form '%s'"), *Context, *FormName));
+	return false;
+}
+
+static bool IMP_PreflightTimelineDefinitions(const TArray<FLispNodePtr>& Forms, FBPImportContext& Ctx)
+{
+	TSet<FString> TimelineNames;
+	TMap<FString, TSet<FString>> TimelineOutputNames;
+	bool bCheckedTimelineSupport = false;
+	for (const FLispNodePtr& Form : Forms)
+	{
+		if (!Form.IsValid() || !Form->IsForm(TEXT("timeline"))) continue;
+		if (Form->Num() < 2 || !Ctx.Blueprint || !Ctx.Graph)
+		{
+			Ctx.Errors.Add(TEXT("IMP: timeline definition is malformed or has no import context"));
+			return false;
+		}
+		if (!bCheckedTimelineSupport)
+		{
+			bCheckedTimelineSupport = true;
+			if (!FBlueprintEditorUtils::DoesSupportTimelines(Ctx.Blueprint)
+				|| !Ctx.Blueprint->GeneratedClass)
+			{
+				Ctx.Errors.Add(FString::Printf(
+					TEXT("IMP: Blueprint '%s' does not support Timeline definitions or has no generated class"),
+					*Ctx.Blueprint->GetName()));
+				return false;
+			}
+		}
+		const FString TimelineName = IMP_GetAtomName(Form->Get(1));
+		const FString LookupName = TimelineName.ToLower();
+		if (TimelineName.IsEmpty() || TimelineNames.Contains(LookupName))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: empty or duplicate timeline definition '%s'"), *TimelineName));
+			return false;
+		}
+		TimelineNames.Add(LookupName);
+
+		float TimelineLength = 0.0f;
+		if (Form->HasKeyword(TEXT(":length"))
+			&& !IMP_TryParseNumberLiteral(Form->GetKeywordArg(TEXT(":length")), TimelineLength))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' :length must be a finite number"), *TimelineName));
+			return false;
+		}
+		const FString LengthMode = IMP_GetAtomName(Form->GetKeywordArg(TEXT(":length-mode")));
+		if (!LengthMode.IsEmpty()
+			&& !LengthMode.Equals(TEXT("last-key-frame"), ESearchCase::IgnoreCase)
+			&& !LengthMode.Equals(TEXT("timeline-length"), ESearchCase::IgnoreCase))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has invalid :length-mode '%s'"), *TimelineName, *LengthMode));
+			return false;
+		}
+		bool bFlag = false;
+		if (!IMP_ReadOptionalTimelineBool(Form, TEXT(":autoplay"), false, bFlag, TimelineName, Ctx)
+			|| !IMP_ReadOptionalTimelineBool(Form, TEXT(":loop"), false, bFlag, TimelineName, Ctx)
+			|| !IMP_ReadOptionalTimelineBool(Form, TEXT(":replicated"), false, bFlag, TimelineName, Ctx)
+			|| !IMP_ReadOptionalTimelineBool(Form, TEXT(":ignore-time-dilation"), false, bFlag, TimelineName, Ctx)) return false;
+		TSet<FString> MetadataKeys;
+		for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+		{
+			const FLispNodePtr Keyword = Form->Get(Index);
+			if (!Keyword.IsValid() || !Keyword->IsKeyword()
+				|| !Keyword->StringValue.Equals(TEXT(":metadata"), ESearchCase::IgnoreCase)) continue;
+			const FLispNodePtr Metadata = Form->Get(++Index);
+			const FString MetadataKey = Metadata.IsValid() && Metadata->IsList() && Metadata->Num() >= 2
+				? IMP_GetAtomName(Metadata->Get(0)) : FString();
+			if (MetadataKey.IsEmpty() || MetadataKeys.Contains(MetadataKey.ToLower()))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has invalid or duplicate :metadata"), *TimelineName));
+				return false;
+			}
+			MetadataKeys.Add(MetadataKey.ToLower());
+		}
+
+		if (Form->HasKeyword(TEXT(":pos")))
+		{
+			TArray<FString> PositionParts;
+			IMP_GetAtomName(Form->GetKeywordArg(TEXT(":pos"))).ParseIntoArray(PositionParts, TEXT(","), true);
+			int32 X = 0, Y = 0;
+			if (PositionParts.Num() != 2
+				|| !LexTryParseString(X, *PositionParts[0].TrimStartAndEnd())
+				|| !LexTryParseString(Y, *PositionParts[1].TrimStartAndEnd()))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has invalid :pos; expected \"x,y\""), *TimelineName));
+				return false;
+			}
+		}
+
+		TSet<FString> TrackNames;
+		TSet<FString> EventTrackNames;
+		TSet<FString> OutputNames;
+		OutputNames.Add(TEXT("direction"));
+		for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+		{
+			const FLispNodePtr Keyword = Form->Get(Index);
+			if (Keyword.IsValid() && Keyword->IsKeyword()
+				&& Keyword->StringValue.Equals(TEXT(":track"), ESearchCase::IgnoreCase))
+			{
+				const FLispNodePtr TrackForm = Form->Get(++Index);
+				if (!IMP_PreflightTimelineTrack(TrackForm, TimelineName, TrackNames, EventTrackNames, Ctx)) return false;
+				if (TrackForm.IsValid() && TrackForm->IsList() && TrackForm->Num() >= 2
+					&& !IMP_GetAtomName(TrackForm->Get(0)).Equals(TEXT("event"), ESearchCase::IgnoreCase))
+				{
+					OutputNames.Add(IMP_GetAtomName(TrackForm->Get(1)).ToLower());
+				}
+			}
+		}
+		TimelineOutputNames.Add(LookupName, MoveTemp(OutputNames));
+		TSet<FString> EventCallbackNames;
+		bool bHasUpdateCallback = false;
+		bool bHasFinishedCallback = false;
+		for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+		{
+			const FLispNodePtr Keyword = Form->Get(Index);
+			if (!Keyword.IsValid() || !Keyword->IsKeyword()) continue;
+			if (Keyword->StringValue.Equals(TEXT(":update"), ESearchCase::IgnoreCase)
+				|| Keyword->StringValue.Equals(TEXT(":finished"), ESearchCase::IgnoreCase))
+			{
+				const bool bIsUpdate = Keyword->StringValue.Equals(TEXT(":update"), ESearchCase::IgnoreCase);
+				bool& bSeenCallback = bIsUpdate ? bHasUpdateCallback : bHasFinishedCallback;
+				if (bSeenCallback)
+				{
+					Ctx.Errors.Add(FString::Printf(
+						TEXT("IMP: Timeline '%s' has a duplicate %s callback"),
+						*TimelineName, bIsUpdate ? TEXT(":update") : TEXT(":finished")));
+					return false;
+				}
+				bSeenCallback = true;
+				const FLispNodePtr CallbackBody = Form->Get(++Index);
+				if (!IMP_PreflightTimelineExecBody(
+					CallbackBody,
+					FString::Printf(TEXT("Timeline '%s' %s"), *TimelineName,
+						bIsUpdate ? TEXT(":update") : TEXT(":finished")),
+					TimelineName,
+					Ctx)) return false;
+				continue;
+			}
+			if (!Keyword->StringValue.Equals(TEXT(":event"), ESearchCase::IgnoreCase)) continue;
+			const FLispNodePtr EventSpec = Form->Get(++Index);
+			const FString EventTrackName = EventSpec.IsValid() && EventSpec->IsList() && EventSpec->Num() >= 2
+				? IMP_GetAtomName(EventSpec->Get(0)).ToLower() : FString();
+			if (EventTrackName.IsEmpty() || !EventTrackNames.Contains(EventTrackName)
+				|| EventCallbackNames.Contains(EventTrackName))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has an invalid, unknown, or duplicate :event callback"), *TimelineName));
+				return false;
+			}
+			EventCallbackNames.Add(EventTrackName);
+			if (!IMP_PreflightTimelineExecBody(
+				EventSpec->Get(1),
+				FString::Printf(TEXT("Timeline '%s' event '%s'"), *TimelineName, *EventTrackName),
+				TimelineName,
+				Ctx)) return false;
+		}
+	}
+
+	TFunction<bool(const FLispNodePtr&)> ValidateTimelineReferences;
+	ValidateTimelineReferences = [&Ctx, &TimelineNames, &TimelineOutputNames, &ValidateTimelineReferences](const FLispNodePtr& Node) -> bool
+	{
+		if (!Node.IsValid() || !Node->IsList()) return true;
+		if (Node->IsForm(TEXT("timeline-control")) || Node->IsForm(TEXT("timeline-output")))
+		{
+			const FString TimelineName = IMP_GetAtomName(Node->GetKeywordArg(TEXT(":timeline")));
+			const FString LookupName = TimelineName.ToLower();
+			UK2Node_Timeline* ExistingTimeline = nullptr;
+			if (!TimelineNames.Contains(LookupName) && Ctx.Graph
+				&& Ctx.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph)
+			{
+				ExistingTimeline = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*TimelineName));
+			}
+			if (LookupName.IsEmpty() || (!TimelineNames.Contains(LookupName) && !ExistingTimeline))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: %s references unknown Timeline '%s'"),
+					*Node->GetFormName(), *TimelineName));
+				return false;
+			}
+
+			if (Node->IsForm(TEXT("timeline-control")))
+			{
+				const FString Action = IMP_GetAtomName(Node->GetKeywordArg(TEXT(":action"))).ToLower();
+				const bool bKnownAction = Action == TEXT("play") || Action == TEXT("play-from-start")
+					|| Action == TEXT("stop") || Action == TEXT("reverse")
+					|| Action == TEXT("reverse-from-end") || Action == TEXT("set-new-time");
+				if (!bKnownAction)
+				{
+					Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has unsupported control action '%s'"),
+						*TimelineName, *Action));
+					return false;
+				}
+				if (Action == TEXT("set-new-time"))
+				{
+					const FLispNodePtr TimeExpr = Node->GetKeywordArg(TEXT(":time"));
+					if (!TimeExpr.IsValid() || TimeExpr->IsNil())
+					{
+						Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' set-new-time requires :time"), *TimelineName));
+						return false;
+					}
+					if (const FLispNodePtr* ExistingExpr = Ctx.TimelineNewTimeExpressions.Find(LookupName))
+					{
+						if (!ExistingExpr->IsValid()
+							|| (*ExistingExpr)->ToString(false, 0) != TimeExpr->ToString(false, 0))
+						{
+							Ctx.Errors.Add(FString::Printf(
+								TEXT("IMP: Timeline '%s' set-new-time controls must use the same shared :time expression"),
+								*TimelineName));
+							return false;
+						}
+					}
+					else
+					{
+						Ctx.TimelineNewTimeExpressions.Add(LookupName, TimeExpr);
+					}
+				}
+			}
+			else
+			{
+				const FString OutputName = IMP_GetAtomName(Node->GetKeywordArg(TEXT(":out-pin")));
+				bool bHasOutput = false;
+				if (const TSet<FString>* Outputs = TimelineOutputNames.Find(LookupName))
+				{
+					bHasOutput = Outputs->Contains(OutputName.ToLower());
+				}
+				else if (ExistingTimeline)
+				{
+					if (UEdGraphPin* OutputPin = ExistingTimeline->FindPin(FName(*OutputName), EGPD_Output))
+					{
+						bHasOutput = OutputPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec;
+					}
+				}
+				if (OutputName.IsEmpty() || !bHasOutput)
+				{
+					Ctx.Errors.Add(FString::Printf(TEXT("IMP: timeline-output references missing data pin '%s.%s'"),
+						*TimelineName, *OutputName));
+					return false;
+				}
+			}
+		}
+		for (int32 Index = 0; Index < Node->Num(); ++Index)
+		{
+			if (!ValidateTimelineReferences(Node->Get(Index))) return false;
+		}
+		return true;
+	};
+	for (const FLispNodePtr& Form : Forms)
+	{
+		if (!ValidateTimelineReferences(Form)) return false;
+	}
+	return Ctx.Errors.Num() == 0;
+}
+
+static UK2Node_Timeline* IMP_FindTimelineNodeInGraph(UEdGraph* Graph, const FName TimelineName)
+{
+	if (!Graph) return nullptr;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+		{
+			if (TimelineNode->TimelineName == TimelineName) return TimelineNode;
+		}
+	}
+	return nullptr;
+}
+
+static void IMP_PrepareTimelineDefinitionsForIncrementalReuse(
+	const TArray<FLispNodePtr>& Forms,
+	FBPImportContext& Ctx)
+{
+	if (Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph || !Ctx.Graph)
+	{
+		return;
+	}
+
+	TSet<FString> PreparedNames;
+	auto CaptureTimeline = [&Ctx, &PreparedNames](const FString& TimelineName, const bool bCaptureCallbacks)
+	{
+		const FString LookupName = TimelineName.ToLower();
+		if (LookupName.IsEmpty() || PreparedNames.Contains(LookupName)) return;
+		PreparedNames.Add(LookupName);
+
+		UK2Node_Timeline* TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*TimelineName));
+		if (!TimelineNode) return;
+
+		TSet<UEdGraphNode*> NodesToReuse;
+		if (bCaptureCallbacks)
+		{
+			Ctx.TimelineReusableCallbackNames.Add(LookupName);
+			for (UEdGraphPin* Pin : TimelineNode->Pins)
+			{
+				if (!Pin || Pin->Direction != EGPD_Output
+					|| Pin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec) continue;
+				IMP_CollectDownstreamExecNodes(Pin, NodesToReuse);
+			}
+		}
+		TArray<UEdGraphNode*> ReusableNodes;
+		TSet<FGuid> AllowedGuids;
+		for (UEdGraphNode* Node : NodesToReuse)
+		{
+			if (!Node || Cast<UK2Node_Timeline>(Node)) continue;
+			IMP_EnsureGuid(Node);
+			ReusableNodes.Add(Node);
+			AllowedGuids.Add(Node->NodeGuid);
+		}
+
+		TMap<FString, UEdGraphNode*> StableIdToNode;
+		IMP_BuildStableIdIndex(Ctx.Graph, false, StableIdToNode, &AllowedGuids, nullptr);
+		Ctx.TimelineReusableBodyNodes.Add(LookupName, MoveTemp(ReusableNodes));
+		Ctx.TimelineReusableBodyStableIdToNode.Add(LookupName, MoveTemp(StableIdToNode));
+	};
+
+	for (const FLispNodePtr& Form : Forms)
+	{
+		if (!Form.IsValid() || !Form->IsForm(TEXT("timeline")) || Form->Num() < 2) continue;
+		CaptureTimeline(IMP_GetAtomName(Form->Get(1)), true);
+	}
+}
+
+static void IMP_DetachTimelineReusableBodyPools(FBPImportContext& Ctx)
+{
+	if (Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph) return;
+	for (const TPair<FString, TArray<UEdGraphNode*>>& Pair : Ctx.TimelineReusableBodyNodes)
+	{
+		UK2Node_Timeline* TimelineNode = Ctx.TimelineNameToNode.FindRef(Pair.Key);
+		if (!TimelineNode)
+		{
+			TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*Pair.Key));
+			if (TimelineNode) Ctx.TimelineNameToNode.Add(Pair.Key, TimelineNode);
+		}
+		if (TimelineNode)
+		{
+			if (Ctx.TimelineReusableCallbackNames.Contains(Pair.Key))
+			{
+				for (UEdGraphPin* Pin : TimelineNode->Pins)
+				{
+					if (Pin && Pin->Direction == EGPD_Output
+						&& Pin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+					{
+						TSet<UEdGraphNode*> VisitedControlNodes;
+						IMP_CollectReachableTimelineControlNames(
+							Pin, Ctx.TouchedTimelineControlNames, VisitedControlNodes);
+						Pin->BreakAllPinLinks();
+					}
+				}
+			}
+		}
+	}
+}
+
+static void IMP_ActivateTimelineReusableBodyPools(FBPImportContext& Ctx)
+{
+	IMP_ResetReusableBodyNodePool(Ctx);
+	if (Ctx.ImportMode == FBlueprintLispConverter::EImportMode::ReplaceGraph) return;
+
+	for (TPair<FString, TArray<UEdGraphNode*>>& Pair : Ctx.TimelineReusableBodyNodes)
+	{
+		for (UEdGraphNode* Node : Pair.Value) Ctx.ReusableBodyNodes.AddUnique(Node);
+	}
+	for (TPair<FString, TMap<FString, UEdGraphNode*>>& Pair : Ctx.TimelineReusableBodyStableIdToNode)
+	{
+		for (const TPair<FString, UEdGraphNode*>& StableNode : Pair.Value)
+		{
+			Ctx.ReusableBodyStableIdToNode.FindOrAdd(StableNode.Key) = StableNode.Value;
+		}
+	}
+	Ctx.TimelineReusableBodyNodes.Reset();
+	Ctx.TimelineReusableBodyStableIdToNode.Reset();
+}
+
+static UK2Node_Timeline* IMP_CreateTimelineDefinition(const FLispNodePtr& Form, FBPImportContext& Ctx)
+{
+	if (!Form.IsValid() || !Form->IsForm(TEXT("timeline")) || Form->Num() < 2 || !Ctx.Blueprint || !Ctx.Graph)
+	{
+		Ctx.Errors.Add(TEXT("IMP: timeline definition is malformed or has no import context"));
+		return nullptr;
+	}
+	const FString TimelineNameString = IMP_GetAtomName(Form->Get(1));
+	const FName TimelineName(*TimelineNameString);
+	if (TimelineName.IsNone())
+	{
+		Ctx.Errors.Add(TEXT("IMP: timeline definition requires a non-empty name"));
+		return nullptr;
+	}
+	const FString LookupName = TimelineNameString.ToLower();
+	if (Ctx.TimelineNameToNode.Contains(LookupName))
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: duplicate timeline definition '%s'"), *TimelineNameString));
+		return nullptr;
+	}
+
+	UTimelineTemplate* Template = Ctx.Blueprint->FindTimelineTemplateByVariableName(TimelineName);
+	if (!Template)
+	{
+		Template = FBlueprintEditorUtils::AddNewTimeline(Ctx.Blueprint, TimelineName);
+	}
+	if (!Template)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: failed to create Timeline template '%s'"), *TimelineNameString));
+		return nullptr;
+	}
+	Template->Modify();
+	while (Template->GetNumDisplayTracks() > 0)
+	{
+		Template->RemoveDisplayTrack(Template->GetNumDisplayTracks() - 1);
+	}
+	Template->EventTracks.Reset();
+	Template->FloatTracks.Reset();
+	Template->VectorTracks.Reset();
+	Template->LinearColorTracks.Reset();
+	Template->MetaDataArray.Reset();
+
+	float TimelineLength = Template->TimelineLength;
+	if (Form->HasKeyword(TEXT(":length"))
+		&& !IMP_TryParseNumberLiteral(Form->GetKeywordArg(TEXT(":length")), TimelineLength))
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' :length must be a finite number"), *TimelineNameString));
+		return nullptr;
+	}
+	Template->TimelineLength = TimelineLength;
+	const FString LengthMode = IMP_GetAtomName(Form->GetKeywordArg(TEXT(":length-mode")));
+	if (LengthMode.IsEmpty() || LengthMode.Equals(TEXT("last-key-frame"), ESearchCase::IgnoreCase))
+	{
+		Template->LengthMode = TL_LastKeyFrame;
+	}
+	else if (LengthMode.Equals(TEXT("timeline-length"), ESearchCase::IgnoreCase))
+	{
+		Template->LengthMode = TL_TimelineLength;
+	}
+	else
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has invalid :length-mode '%s'"), *TimelineNameString, *LengthMode));
+		return nullptr;
+	}
+
+	bool bFlag = false;
+	if (!IMP_ReadOptionalTimelineBool(Form, TEXT(":autoplay"), false, bFlag, TimelineNameString, Ctx)) return nullptr;
+	Template->bAutoPlay = bFlag;
+	if (!IMP_ReadOptionalTimelineBool(Form, TEXT(":loop"), false, bFlag, TimelineNameString, Ctx)) return nullptr;
+	Template->bLoop = bFlag;
+	if (!IMP_ReadOptionalTimelineBool(Form, TEXT(":replicated"), false, bFlag, TimelineNameString, Ctx)) return nullptr;
+	Template->bReplicated = bFlag;
+	if (!IMP_ReadOptionalTimelineBool(Form, TEXT(":ignore-time-dilation"), false, bFlag, TimelineNameString, Ctx)) return nullptr;
+	Template->bIgnoreTimeDilation = bFlag;
+
+	for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+	{
+		const FLispNodePtr Keyword = Form->Get(Index);
+		if (!Keyword.IsValid() || !Keyword->IsKeyword()
+			|| !Keyword->StringValue.Equals(TEXT(":metadata"), ESearchCase::IgnoreCase)) continue;
+		const FLispNodePtr Metadata = Form->Get(++Index);
+		if (!Metadata.IsValid() || !Metadata->IsList() || Metadata->Num() < 2) return nullptr;
+		Template->MetaDataArray.Emplace(
+			FName(*IMP_GetAtomName(Metadata->Get(0))), IMP_GetAtomName(Metadata->Get(1)));
+	}
+
+	for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+	{
+		const FLispNodePtr Keyword = Form->Get(Index);
+		if (Keyword.IsValid() && Keyword->IsKeyword()
+			&& Keyword->StringValue.Equals(TEXT(":track"), ESearchCase::IgnoreCase))
+		{
+			if (!IMP_AddTimelineTrack(Form->Get(++Index), Template, TimelineNameString, Ctx)) return nullptr;
+		}
+	}
+
+	UK2Node_Timeline* TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, TimelineName);
+	const bool bReusingTimelineNode = TimelineNode != nullptr;
+	int32 TimelinePosX = TimelineNode ? TimelineNode->NodePosX : Ctx.CurrentX;
+	int32 TimelinePosY = TimelineNode ? TimelineNode->NodePosY : Ctx.CurrentY;
+	if (Form->HasKeyword(TEXT(":pos")))
+	{
+		TArray<FString> PositionParts;
+		IMP_GetAtomName(Form->GetKeywordArg(TEXT(":pos"))).ParseIntoArray(PositionParts, TEXT(","), true);
+		if (PositionParts.Num() != 2
+			|| !LexTryParseString(TimelinePosX, *PositionParts[0].TrimStartAndEnd())
+			|| !LexTryParseString(TimelinePosY, *PositionParts[1].TrimStartAndEnd()))
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has invalid :pos; expected \"x,y\""), *TimelineNameString));
+			return nullptr;
+		}
+	}
+
+	if (!TimelineNode)
+	{
+		TimelineNode = NewObject<UK2Node_Timeline>(Ctx.Graph);
+		TimelineNode->TimelineName = TimelineName;
+		TimelineNode->TimelineGuid = Template->TimelineGuid;
+		TimelineNode->NodePosX = TimelinePosX;
+		TimelineNode->NodePosY = TimelinePosY;
+		TimelineNode->CreateNewGuid();
+		Ctx.Graph->AddNode(TimelineNode, false, false);
+		TimelineNode->PostPlacedNewNode();
+		TimelineNode->AllocateDefaultPins();
+	}
+	else
+	{
+		TimelineNode->Modify();
+		TimelineNode->TimelineName = TimelineName;
+		TimelineNode->TimelineGuid = Template->TimelineGuid;
+		TimelineNode->NodePosX = TimelinePosX;
+		TimelineNode->NodePosY = TimelinePosY;
+		TimelineNode->ReconstructNode();
+	}
+	IMP_ApplyRequestedStableId(TimelineNode, Form, false, bReusingTimelineNode);
+	IMP_RegisterImportedStableNode(TimelineNode, Form, Ctx);
+	Ctx.TempIdToNode.FindOrAdd(TimelineNode->NodeGuid.ToString()) = TimelineNode;
+	Ctx.TimelineNameToNode.Add(LookupName, TimelineNode);
+	Ctx.TimelineNameToTemplate.Add(LookupName, Template);
+	Ctx.AdvancePosition();
+	return TimelineNode;
+}
+
+static bool IMP_CreateTimelineDefinitions(const TArray<FLispNodePtr>& Forms, FBPImportContext& Ctx)
+{
+	for (const FLispNodePtr& Form : Forms)
+	{
+		if (Form.IsValid() && Form->IsForm(TEXT("timeline")) && !IMP_CreateTimelineDefinition(Form, Ctx))
+		{
+			return false;
+		}
+	}
+	return Ctx.Errors.Num() == 0;
+}
+
+static void IMP_ImportTimelineCallbacks(const FLispNodePtr& Form, FBPImportContext& Ctx)
+{
+	if (!Form.IsValid() || !Form->IsForm(TEXT("timeline")) || Form->Num() < 2) return;
+	const FString TimelineName = IMP_GetAtomName(Form->Get(1));
+	UK2Node_Timeline* TimelineNode = Ctx.TimelineNameToNode.FindRef(TimelineName.ToLower());
+	if (!TimelineNode)
+	{
+		Ctx.Errors.Add(FString::Printf(TEXT("IMP: callback target Timeline '%s' was not created"), *TimelineName));
+		return;
+	}
+	auto ImportCallback = [&Ctx](UEdGraphPin* CallbackPin, const FLispNodePtr& Body)
+	{
+		if (!CallbackPin) return;
+		CallbackPin->BreakAllPinLinks();
+		if (!Body.IsValid() || Body->IsNil()) return;
+		UEdGraphPin* CurrentExecPin = CallbackPin;
+		IMP_ConvertExecBody(Body, Ctx, CurrentExecPin);
+	};
+	ImportCallback(TimelineNode->GetUpdatePin(), Form->GetKeywordArg(TEXT(":update")));
+	ImportCallback(TimelineNode->GetFinishedPin(), Form->GetKeywordArg(TEXT(":finished")));
+	for (int32 Index = 2; Index + 1 < Form->Num(); ++Index)
+	{
+		const FLispNodePtr Keyword = Form->Get(Index);
+		if (!Keyword.IsValid() || !Keyword->IsKeyword()
+			|| !Keyword->StringValue.Equals(TEXT(":event"), ESearchCase::IgnoreCase)) continue;
+		const FLispNodePtr EventSpec = Form->Get(++Index);
+		if (!EventSpec.IsValid() || !EventSpec->IsList() || EventSpec->Num() < 2)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' has an invalid :event callback"), *TimelineName));
+			continue;
+		}
+		const FString TrackName = IMP_GetAtomName(EventSpec->Get(0));
+		UEdGraphPin* EventPin = TimelineNode->FindPin(FName(*TrackName), EGPD_Output);
+		if (!EventPin || EventPin->PinType.PinCategory != UEdGraphSchema_K2::PC_Exec)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' event track pin '%s' was not found"), *TimelineName, *TrackName));
+			continue;
+		}
+		ImportCallback(EventPin, EventSpec->Get(1));
+	}
+}
+
+static bool IMP_ImportAllTimelineCallbacks(const TArray<FLispNodePtr>& Forms, FBPImportContext& Ctx)
+{
+	IMP_ActivateTimelineReusableBodyPools(Ctx);
+	for (const FLispNodePtr& Form : Forms)
+	{
+		if (Form.IsValid() && Form->IsForm(TEXT("timeline"))) IMP_ImportTimelineCallbacks(Form, Ctx);
+	}
+	if (Ctx.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+	}
+	return Ctx.Errors.Num() == 0;
+}
+
+static bool IMP_PrepareTimelineNewTimeForImport(
+	UK2Node_Timeline* TimelineNode,
+	FBPImportContext& Ctx,
+	bool& bOutFinalizeStandalonePool)
+{
+	bOutFinalizeStandalonePool = false;
+	UEdGraphPin* NewTimePin = TimelineNode ? TimelineNode->GetNewTimePin() : nullptr;
+	if (!NewTimePin) return false;
+
+	if (Ctx.ImportMode != FBlueprintLispConverter::EImportMode::ReplaceGraph)
+	{
+		const bool bHadActivePool = Ctx.ReusableBodyNodes.Num() > 0;
+		TSet<UEdGraphNode*> NewTimeNodes;
+		IMP_CollectPureDependencyNodes(NewTimePin, NewTimeNodes);
+		TSet<FGuid> AllowedGuids;
+		for (UEdGraphNode* Node : NewTimeNodes)
+		{
+			if (!Node || Cast<UK2Node_Timeline>(Node)) continue;
+			IMP_EnsureGuid(Node);
+			Ctx.ReusableBodyNodes.AddUnique(Node);
+			AllowedGuids.Add(Node->NodeGuid);
+		}
+		TMap<FString, UEdGraphNode*> StableNodes;
+		IMP_BuildStableIdIndex(Ctx.Graph, false, StableNodes, &AllowedGuids, nullptr);
+		for (const TPair<FString, UEdGraphNode*>& StableNode : StableNodes)
+		{
+			Ctx.ReusableBodyStableIdToNode.FindOrAdd(StableNode.Key) = StableNode.Value;
+		}
+		bOutFinalizeStandalonePool = !bHadActivePool && NewTimeNodes.Num() > 0;
+	}
+
+	NewTimePin->BreakAllPinLinks();
+	if (const UEdGraphSchema* Schema = Ctx.Graph ? Ctx.Graph->GetSchema() : nullptr)
+	{
+		Schema->ResetPinToAutogeneratedDefaultValue(NewTimePin, false);
+	}
+	return true;
+}
+
+static void IMP_RemoveDeadTimelineNewTimeDependencies(FBPImportContext& Ctx)
+{
+	if (!Ctx.Graph) return;
+	for (const FString& TimelineName : Ctx.TouchedTimelineControlNames)
+	{
+		UK2Node_Timeline* TimelineNode = Ctx.TimelineNameToNode.FindRef(TimelineName);
+		if (!TimelineNode)
+		{
+			TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*TimelineName));
+			if (TimelineNode) Ctx.TimelineNameToNode.Add(TimelineName, TimelineNode);
+		}
+		if (!TimelineNode) continue;
+		UEdGraphPin* SetNewTimePin = TimelineNode->GetSetNewTimePin();
+		UEdGraphPin* NewTimePin = TimelineNode->GetNewTimePin();
+		if (!SetNewTimePin || !NewTimePin || SetNewTimePin->LinkedTo.Num() > 0) continue;
+
+		TSet<UEdGraphNode*> CandidateNodes;
+		IMP_CollectPureDependencyNodes(NewTimePin, CandidateNodes);
+		NewTimePin->BreakAllPinLinks();
+		if (const UEdGraphSchema* Schema = Ctx.Graph->GetSchema())
+		{
+			Schema->ResetPinToAutogeneratedDefaultValue(NewTimePin, false);
+		}
+
+		TSet<UEdGraphNode*> RemovableNodes;
+		for (UEdGraphNode* Node : CandidateNodes)
+		{
+			if (const UK2Node* K2Node = Cast<UK2Node>(Node); K2Node && K2Node->IsNodePure())
+			{
+				RemovableNodes.Add(Node);
+			}
+		}
+		bool bChanged = true;
+		while (bChanged)
+		{
+			bChanged = false;
+			for (auto It = RemovableNodes.CreateIterator(); It; ++It)
+			{
+				UEdGraphNode* Node = *It;
+				bool bHasExternalConsumer = false;
+				for (UEdGraphPin* Pin : Node->Pins)
+				{
+					if (!Pin || Pin->Direction != EGPD_Output) continue;
+					for (UEdGraphPin* LinkedPin : Pin->LinkedTo)
+					{
+						UEdGraphNode* Consumer = LinkedPin ? LinkedPin->GetOwningNode() : nullptr;
+						if (Consumer && !RemovableNodes.Contains(Consumer))
+						{
+							bHasExternalConsumer = true;
+							break;
+						}
+					}
+					if (bHasExternalConsumer) break;
+				}
+				if (bHasExternalConsumer)
+				{
+					It.RemoveCurrent();
+					bChanged = true;
+				}
+			}
+		}
+		for (UEdGraphNode* Node : RemovableNodes)
+		{
+			if (Node && !Cast<UK2Node_Timeline>(Node)) Ctx.Graph->RemoveNode(Node);
+		}
+	}
+}
+
 static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarName, const FLispNodePtr& Expr, const FEdGraphPinType& PinType, FString& OutDefaultValue, FBPImportContext& Ctx)
 {
 	OutDefaultValue.Reset();
@@ -6897,7 +9062,7 @@ static bool IMP_TryBuildBlueprintVariableDefaultValueString(const FString& VarNa
 #endif
 			)
 		{
-			OutDefaultValue = FString::SanitizeFloat(Expr->NumberValue);
+			OutDefaultValue = BP_NumberToRoundTripString(Expr->NumberValue);
 			return true;
 		}
 
@@ -7918,6 +10083,31 @@ static void IMP_ConvertActorBoundEventForm(const FLispNodePtr& Form, FBPImportCo
 static UEdGraphPin* IMP_ResolveLispExprInternal(const FLispNodePtr& Expr, FBPImportContext& Ctx)
 {
 	if (!Expr.IsValid() || Expr->IsNil()) return nullptr;
+	if (Expr->IsForm(TEXT("timeline-output")))
+	{
+		const FString TimelineName = IMP_GetAtomName(Expr->GetKeywordArg(TEXT(":timeline")));
+		const FString OutputPinName = IMP_GetAtomName(Expr->GetKeywordArg(TEXT(":out-pin")));
+		UK2Node_Timeline* TimelineNode = Ctx.TimelineNameToNode.FindRef(TimelineName.ToLower());
+		if (!TimelineNode && Ctx.Graph)
+		{
+			TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*TimelineName));
+			if (TimelineNode) Ctx.TimelineNameToNode.Add(TimelineName.ToLower(), TimelineNode);
+		}
+		if (!TimelineNode)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: timeline-output references unknown Timeline '%s'"), *TimelineName));
+			return nullptr;
+		}
+		UEdGraphPin* OutputPin = TimelineNode->FindPin(FName(*OutputPinName), EGPD_Output);
+		if (!OutputPin || OutputPin->PinType.PinCategory == UEdGraphSchema_K2::PC_Exec)
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: timeline-output references missing data pin '%s.%s'"),
+				*TimelineName, *OutputPinName));
+			return nullptr;
+		}
+		return OutputPin;
+	}
 
 	// Symbol: variable lookup or self
 	if (Expr->IsSymbol())
@@ -8630,7 +10820,9 @@ static UEdGraphPin* IMP_ResolveLispExpr(const FLispNodePtr& Expr, FBPImportConte
 	UEdGraphPin* ResolvedPin = IMP_ResolveLispExprInternal(Expr, Ctx);
 	if (ResolvedPin)
 	{
-		IMP_ApplyRequestedStableId(ResolvedPin->GetOwningNode(), Expr, false);
+		IMP_ApplyRequestedStableId(
+			ResolvedPin->GetOwningNode(), Expr, false,
+			Ctx.ReusableBodyNodes.Contains(ResolvedPin->GetOwningNode()));
 		IMP_RegisterImportedStableNode(ResolvedPin->GetOwningNode(), Expr, Ctx);
 		Ctx.TempIdToNode.FindOrAdd(ResolvedPin->GetOwningNode()->NodeGuid.ToString()) = ResolvedPin->GetOwningNode();
 	}
@@ -8643,7 +10835,8 @@ static UEdGraphNode* IMP_ConvertFormToNodeStable(const FLispNodePtr& Form, FBPIm
 	UEdGraphNode* Node = IMP_ConvertFormToNode(Form, Ctx, OutExecPin);
 	if (Node)
 	{
-		IMP_ApplyRequestedStableId(Node, Form, false);
+		IMP_ApplyRequestedStableId(Node, Form, false, Ctx.ReusableBodyNodes.Contains(Node));
+		IMP_RegisterImportedStableNode(Node, Form, Ctx);
 		Ctx.TempIdToNode.FindOrAdd(Node->NodeGuid.ToString()) = Node;
 	}
 	return Node;
@@ -8652,9 +10845,71 @@ static UEdGraphNode* IMP_ConvertFormToNodeStable(const FLispNodePtr& Form, FBPIm
 static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportContext& Ctx, UEdGraphPin*& OutExecPin)
 {
 	OutExecPin = nullptr;
+	Ctx.PendingExplicitExecInputPin = nullptr;
 	if (!Form.IsValid() || !Form->IsList() || Form->Num() == 0) return nullptr;
 
 	FString FormName = Form->GetFormName();
+	if (FormName.Equals(TEXT("timeline-control"), ESearchCase::IgnoreCase))
+	{
+		const FString TimelineName = IMP_GetAtomName(Form->GetKeywordArg(TEXT(":timeline")));
+		const FString Action = IMP_GetAtomName(Form->GetKeywordArg(TEXT(":action"))).ToLower();
+		UK2Node_Timeline* TimelineNode = Ctx.TimelineNameToNode.FindRef(TimelineName.ToLower());
+		if (!TimelineNode && Ctx.Graph)
+		{
+			TimelineNode = IMP_FindTimelineNodeInGraph(Ctx.Graph, FName(*TimelineName));
+			if (TimelineNode) Ctx.TimelineNameToNode.Add(TimelineName.ToLower(), TimelineNode);
+		}
+		if (!TimelineNode)
+		{
+			Ctx.Errors.Add(FString::Printf(TEXT("IMP: timeline-control references unknown Timeline '%s'"), *TimelineName));
+			return nullptr;
+		}
+
+		UEdGraphPin* ActionPin = nullptr;
+		if (Action == TEXT("play")) ActionPin = TimelineNode->GetPlayPin();
+		else if (Action == TEXT("play-from-start")) ActionPin = TimelineNode->GetPlayFromStartPin();
+		else if (Action == TEXT("stop")) ActionPin = TimelineNode->GetStopPin();
+		else if (Action == TEXT("reverse")) ActionPin = TimelineNode->GetReversePin();
+		else if (Action == TEXT("reverse-from-end")) ActionPin = TimelineNode->GetReverseFromEndPin();
+		else if (Action == TEXT("set-new-time")) ActionPin = TimelineNode->GetSetNewTimePin();
+		else
+		{
+			Ctx.Errors.Add(FString::Printf(
+				TEXT("IMP: Timeline '%s' has unsupported control action '%s'"),
+				*TimelineName, *Action));
+			return nullptr;
+		}
+		Ctx.TouchedTimelineControlNames.Add(TimelineName.ToLower());
+
+		const FString TimelineLookupName = TimelineName.ToLower();
+		if (Action == TEXT("set-new-time")
+			&& !Ctx.ImportedTimelineNewTimeNames.Contains(TimelineLookupName))
+		{
+			bool bFinalizeStandaloneNewTimePool = false;
+			if (!IMP_PrepareTimelineNewTimeForImport(
+				TimelineNode, Ctx, bFinalizeStandaloneNewTimePool))
+			{
+				Ctx.Errors.Add(FString::Printf(
+					TEXT("IMP: Timeline '%s' has no NewTime input pin"), *TimelineName));
+				return nullptr;
+			}
+			const FLispNodePtr* SharedTimeExpr = Ctx.TimelineNewTimeExpressions.Find(TimelineLookupName);
+			const FLispNodePtr TimeExpr = SharedTimeExpr ? *SharedTimeExpr : Form->GetKeywordArg(TEXT(":time"));
+			if (!TimeExpr.IsValid() || TimeExpr->IsNil()
+				|| !IMP_SetPinFromExpr(TimelineNode->GetNewTimePin(), TimeExpr, Ctx))
+			{
+				Ctx.Errors.Add(FString::Printf(TEXT("IMP: Timeline '%s' set-new-time requires a valid :time expression"), *TimelineName));
+				return nullptr;
+			}
+			Ctx.ImportedTimelineNewTimeNames.Add(TimelineLookupName);
+			if (bFinalizeStandaloneNewTimePool)
+			{
+				IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+			}
+		}
+		Ctx.PendingExplicitExecInputPin = ActionPin;
+		return TimelineNode;
+	}
 
 	// (seq s1 s2 ...) 鈥?execute in order; if it carries :id, treat it as an actual UK2Node_ExecutionSequence
 	if (FormName.Equals(TEXT("seq"), ESearchCase::IgnoreCase))
@@ -8700,7 +10955,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			if (SN)
 			{
 				if (!First) First = SN;
-				if (CurExec) if (UEdGraphPin* In = IMP_GetExecInput(SN)) IMP_Connect(CurExec, In, Ctx);
+				if (CurExec) if (UEdGraphPin* In = IMP_GetExecInput(SN, &Ctx)) IMP_Connect(CurExec, In, Ctx);
 				IMP_UpdateCurrentExecPin(SN, StmtOut, CurExec);
 			}
 		}
@@ -9409,7 +11664,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 		if (ExprNode->IsNumber())
 		{
 			Ctx.VariableToNodeId.Add(VarName, TEXT("_literal_") + VarName);
-			Ctx.VariableToPin.Add(VarName, FString::SanitizeFloat(ExprNode->NumberValue));
+			Ctx.VariableToPin.Add(VarName, BP_NumberToRoundTripString(ExprNode->NumberValue));
 			return nullptr;
 		}
 		if (ExprNode->IsString())
@@ -9582,7 +11837,7 @@ static UEdGraphNode* IMP_ConvertFormToNode(const FLispNodePtr& Form, FBPImportCo
 			return nullptr;
 		}
 
-		IMP_ApplyRequestedStableId(ResultNode, Form, false);
+		IMP_ApplyRequestedStableId(ResultNode, Form, false, true);
 		IMP_ClearAllNodeLinks(ResultNode);
 		Ctx.ConsumedFunctionResultGuids.Add(ResultNode->NodeGuid);
 		for (int32 i = 1; i < Form->Num(); ++i)
@@ -9739,19 +11994,24 @@ static void IMP_ConvertExecBody(const FLispNodePtr& Body, FBPImportContext& Ctx,
 	{
 		for (int32 i = 1; i < Body->Num(); i++)
 		{
+			if (IMP_QueueExecReference(Body->Get(i), Ctx, CurrentExecPin))
+			{
+				continue;
+			}
 			UEdGraphPin* StmtOut = nullptr;
 			UEdGraphNode* SN = IMP_ConvertFormToNodeStable(Body->Get(i), Ctx, StmtOut);
 			if (SN && CurrentExecPin)
-				if (UEdGraphPin* In = IMP_GetExecInput(SN)) IMP_Connect(CurrentExecPin, In, Ctx);
+				if (UEdGraphPin* In = IMP_GetExecInput(SN, &Ctx)) IMP_Connect(CurrentExecPin, In, Ctx);
 			IMP_UpdateCurrentExecPin(SN, StmtOut, CurrentExecPin);
 		}
 	}
 	else
 	{
+		if (IMP_QueueExecReference(Body, Ctx, CurrentExecPin)) return;
 		UEdGraphPin* StmtOut = nullptr;
 		UEdGraphNode* SN = IMP_ConvertFormToNodeStable(Body, Ctx, StmtOut);
 		if (SN && CurrentExecPin)
-			if (UEdGraphPin* In = IMP_GetExecInput(SN)) IMP_Connect(CurrentExecPin, In, Ctx);
+			if (UEdGraphPin* In = IMP_GetExecInput(SN, &Ctx)) IMP_Connect(CurrentExecPin, In, Ctx);
 		IMP_UpdateCurrentExecPin(SN, StmtOut, CurrentExecPin);
 	}
 
@@ -9812,7 +12072,7 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 		EventNode->AllocateDefaultPins();
 		IMP_EnsureGuid(EventNode);
 	}
-	IMP_ApplyRequestedStableId(EventNode, EventForm, true);
+	IMP_ApplyRequestedStableId(EventNode, EventForm, true, bReusedExistingEventNode);
 
 	if (EventNode)
 	{
@@ -9923,7 +12183,7 @@ static void IMP_ConvertEventForm(const FLispNodePtr& EventForm, FBPImportContext
 		UEdGraphPin* StmtOut = nullptr;
 		UEdGraphNode* SN = IMP_ConvertFormToNodeStable(EventForm->Get(i), Ctx, StmtOut);
 		if (SN && CurrentExecPin)
-			if (UEdGraphPin* In = IMP_GetExecInput(SN)) IMP_Connect(CurrentExecPin, In, Ctx);
+			if (UEdGraphPin* In = IMP_GetExecInput(SN, &Ctx)) IMP_Connect(CurrentExecPin, In, Ctx);
 		if (StmtOut) CurrentExecPin = StmtOut;
 		else if (SN && !Cast<UK2Node_IfThenElse>(SN)) CurrentExecPin = IMP_GetExecOutput(SN);
 	}
@@ -9978,7 +12238,7 @@ static UEdGraphPin* BuildPureExprNode(
 	// --- Literals ---
 	if (Expr->IsNumber())
 	{
-		OutLiteralValue = FString::SanitizeFloat(Expr->NumberValue);
+		OutLiteralValue = BP_NumberToRoundTripString(Expr->NumberValue);
 		return nullptr;
 	}
 	if (Expr->IsString())
@@ -10294,6 +12554,7 @@ FBlueprintLispResult FBlueprintLispConverter::ExportGraph(
 
 	TArray<FString> ExportErrors;
 	FScopedBlueprintLispExportErrors ExportErrorScope(ExportErrors);
+	const bool bNeedsExecReferences = EXP_HasConvergentExecOwnership(Graph);
 
 	TArray<FGuid> EventGuids, NodeGuids;
 	for (UEdGraphNode* Node : Graph->Nodes)
@@ -10307,49 +12568,69 @@ FBlueprintLispResult FBlueprintLispConverter::ExportGraph(
 			NodeGuids.Add(Node->NodeGuid);
 	}
 	TMap<FGuid, FString> ShortEventIds = Options.bStableIds ? ComputeShortIds(EventGuids) : TMap<FGuid,FString>();
-	TMap<FGuid, FString> ShortNodeIds  = Options.bStableIds ? ComputeShortIds(NodeGuids)  : TMap<FGuid,FString>();
+	TMap<FGuid, FString> ShortNodeIds  = (Options.bStableIds || bNeedsExecReferences)
+		? ComputeShortIds(NodeGuids) : TMap<FGuid,FString>();
 
 	TArray<FString> Forms;
+	TSet<UEdGraphNode*> ExecVisited;
+	TSet<FName> ExportedTimelineNames;
+	for (UEdGraphNode* Node : Graph->Nodes)
+	{
+		if (UK2Node_Timeline* TimelineNode = Cast<UK2Node_Timeline>(Node))
+		{
+			if (ExportedTimelineNames.Contains(TimelineNode->TimelineName))
+			{
+				EXP_AddExportError(FString::Printf(
+					TEXT("Graph '%s' contains more than one Timeline node named '%s'"),
+					*Graph->GetName(), *TimelineNode->TimelineName.ToString()));
+				continue;
+			}
+			ExportedTimelineNames.Add(TimelineNode->TimelineName);
+			FLispNodePtr Form = ConvertTimelineToLisp(
+				TimelineNode, Graph, Options.bIncludePositions, ShortNodeIds, ExecVisited);
+			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
+		}
+	}
 	for (UEdGraphNode* Node : Graph->Nodes)
 	{
 		if (UK2Node_InputAction* IA = Cast<UK2Node_InputAction>(Node))
 		{
-			FLispNodePtr Form = ConvertInputActionToLisp(IA, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertInputActionToLisp(IA, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_InputKey* IK = Cast<UK2Node_InputKey>(Node))
 		{
-			FLispNodePtr Form = ConvertInputKeyToLisp(IK, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertInputKeyToLisp(IK, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_CustomEvent* CE = Cast<UK2Node_CustomEvent>(Node))
 		{
-			FLispNodePtr Form = ConvertCustomEventToLisp(CE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertCustomEventToLisp(CE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_ComponentBoundEvent* CBE = Cast<UK2Node_ComponentBoundEvent>(Node))
 		{
-			FLispNodePtr Form = ConvertComponentBoundEventToLisp(CBE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertComponentBoundEventToLisp(CBE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_ActorBoundEvent* ABE = Cast<UK2Node_ActorBoundEvent>(Node))
 		{
-			FLispNodePtr Form = ConvertActorBoundEventToLisp(ABE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertActorBoundEventToLisp(ABE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_Event* E = Cast<UK2Node_Event>(Node))
 		{
-			FLispNodePtr Form = ConvertEventToLisp(E, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertEventToLisp(E, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_FunctionEntry* FE = Cast<UK2Node_FunctionEntry>(Node))
 		{
-			FLispNodePtr Form = ConvertFunctionEntryToLisp(FE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertFunctionEntryToLisp(FE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 		else if (UK2Node_Tunnel* TE = Cast<UK2Node_Tunnel>(Node); TE && TE->DrawNodeAsEntry())
 		{
-			FLispNodePtr Form = ConvertTunnelEntryToLisp(TE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds);
+			FLispNodePtr Form = ConvertTunnelEntryToLisp(TE, Graph, Options.bIncludePositions, ShortEventIds, ShortNodeIds, ExecVisited);
 			if (Form.IsValid() && !Form->IsNil()) Forms.Add(Form->ToString(Options.bPrettyPrint, 0));
 		}
 	}
@@ -10487,6 +12768,7 @@ FBlueprintLispResult FBlueprintLispConverter::Validate(const FString& LispCode)
 		FString Form = Node->GetFormName().ToLower();
 		static const TSet<FString> ValidForms = {
 			TEXT("event"), TEXT("input-action"), TEXT("input-key"), TEXT("component-bound-event"), TEXT("actor-bound-event"),
+			TEXT("timeline"),
 			TEXT("func"), TEXT("function"), TEXT("macro"), TEXT("exit"),
 			TEXT("call-macro"),
 			TEXT("var"), TEXT("comment"),
@@ -10556,6 +12838,10 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	{
 		return FBlueprintLispResult::Fail(Ctx.Errors.Num() > 0 ? Ctx.Errors[0] : TEXT("Import aborted due to unsupported DSL forms"));
 	}
+	if (!IMP_PreflightTimelineDefinitions(PR.Nodes, Ctx))
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import Timeline preflight failed"));
+	}
 
 	IMP_EnsureBlueprintVariablesFromTopLevelForms(PR.Nodes, Ctx);
 	if (Ctx.Errors.Num() > 0)
@@ -10570,14 +12856,24 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 	{
 		IMP_ClearGraphForReplace(Graph, IMP_DetectGraphKind(Graph));
 	}
+	IMP_PrepareTimelineDefinitionsForIncrementalReuse(PR.Nodes, Ctx);
+	if (!IMP_CreateTimelineDefinitions(PR.Nodes, Ctx))
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import Timeline definitions failed"));
+	}
+	IMP_DetachTimelineReusableBodyPools(Ctx);
 
 	// Process top-level forms
-	int32 EventsCreated = 0;
+	int32 EventsCreated = Ctx.TimelineNameToNode.Num();
 	for (const FLispNodePtr& Form : PR.Nodes)
 	{
 		if (!Form->IsList() || Form->Num() == 0) continue;
 		FString FormName = Form->GetFormName();
 
+		if (FormName.Equals(TEXT("timeline"), ESearchCase::IgnoreCase))
+		{
+			continue;
+		}
 		if (FormName.Equals(TEXT("event"), ESearchCase::IgnoreCase))
 		{
 			IMP_ConvertEventForm(Form, Ctx);
@@ -10655,7 +12951,7 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 
 			{
 
-				IMP_ApplyRequestedStableId(ExistingEntry, Form, true);
+				IMP_ApplyRequestedStableId(ExistingEntry, Form, true, true);
 				IMP_EnsureFunctionEntryParamsFromFunctionForm(ExistingEntry, Form, Ctx);
 				IMP_EnsureFunctionLocalsFromFunctionForm(ExistingEntry, Form, Ctx);
 				IMP_EnsureFunctionResultFromFunctionForm(ExistingEntry, Form, Ctx);
@@ -10704,7 +13000,7 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 					UEdGraphNode* NewNode = IMP_ConvertFormToNodeStable(Form->Get(i), Ctx, OutPin);
 					if (CurrentExecPin && NewNode)
 					{
-						UEdGraphPin* InExec = IMP_GetExecInput(NewNode);
+						UEdGraphPin* InExec = IMP_GetExecInput(NewNode, &Ctx);
 						if (InExec) IMP_Connect(CurrentExecPin, InExec, Ctx);
 					}
 					IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
@@ -10744,7 +13040,7 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 
 			{
 
-				IMP_ApplyRequestedStableId(ExistingTunnel, Form, true);
+				IMP_ApplyRequestedStableId(ExistingTunnel, Form, true, true);
 				FString EntryGuid = ExistingTunnel->NodeGuid.ToString();
 				Ctx.TempIdToNode.Add(EntryGuid, ExistingTunnel);
 
@@ -10782,7 +13078,7 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 					UEdGraphNode* NewNode = IMP_ConvertFormToNodeStable(Form->Get(i), Ctx, OutPin);
 					if (CurrentExecPin && NewNode)
 					{
-						UEdGraphPin* InExec = IMP_GetExecInput(NewNode);
+						UEdGraphPin* InExec = IMP_GetExecInput(NewNode, &Ctx);
 						if (InExec) IMP_Connect(CurrentExecPin, InExec, Ctx);
 					}
 					IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
@@ -10808,6 +13104,22 @@ FBlueprintLispResult FBlueprintLispConverter::Import(
 			UEdGraphPin* ExecOut = nullptr;
 			IMP_ConvertFormToNodeStable(Form, Ctx, ExecOut);
 		}
+	}
+	if (Ctx.Errors.Num() > 0)
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import root forms failed before Timeline callbacks"));
+	}
+	if (!IMP_ImportAllTimelineCallbacks(PR.Nodes, Ctx))
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import Timeline callbacks failed"));
+	}
+	if (!IMP_ResolvePendingExecReferences(Ctx))
+	{
+		return IMP_FailFromContext(Ctx, TEXT("Import execution references failed"));
+	}
+	if (Ctx.Errors.Num() == 0)
+	{
+		IMP_RemoveDeadTimelineNewTimeDependencies(Ctx);
 	}
 
 	// Reconstruct all nodes to resolve wildcards
@@ -10868,6 +13180,26 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 	FBPImportContext ValidationCtx;
 	ValidationCtx.Graph = Graph;
 	ValidationCtx.Blueprint = Graph->GetTypedOuter<UBlueprint>();
+	if (ValidationCtx.Blueprint && ValidationCtx.Blueprint->UbergraphPages.Contains(Graph))
+	{
+		bool bContainsEventGraphForm = false;
+		for (const FLispNodePtr& Candidate : PR.Nodes)
+		{
+			if (!Candidate.IsValid() || !Candidate->IsList()) continue;
+			const FString CandidateName = Candidate->GetFormName().ToLower();
+			if (CandidateName == TEXT("timeline") || CandidateName == TEXT("event")
+				|| CandidateName == TEXT("input-action") || CandidateName == TEXT("input-key")
+				|| CandidateName == TEXT("component-bound-event") || CandidateName == TEXT("actor-bound-event"))
+			{
+				bContainsEventGraphForm = true;
+				break;
+			}
+		}
+		if (bContainsEventGraphForm)
+		{
+			return Import(ValidationCtx.Blueprint, Graph->GetName(), LispCode, Options);
+		}
+	}
 
 	const BlueprintLispImportLifecycle::FImportLifecycleContext LifecycleContext =
 		IMP_MakeLifecycleContext(ValidationCtx.Blueprint, Graph, Options);
@@ -10944,7 +13276,7 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		Ctx.Graph     = Graph;
 		Ctx.ImportMode = Options.ImportMode;
 
-		IMP_ApplyRequestedStableId(ExistingEntry, TopExpr, true);
+		IMP_ApplyRequestedStableId(ExistingEntry, TopExpr, true, true);
 		IMP_EnsureFunctionEntryParamsFromFunctionForm(ExistingEntry, TopExpr, Ctx);
 		IMP_EnsureFunctionLocalsFromFunctionForm(ExistingEntry, TopExpr, Ctx);
 		IMP_EnsureFunctionResultFromFunctionForm(ExistingEntry, TopExpr, Ctx);
@@ -10992,11 +13324,15 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 
 		for (int32 i = BodyStart; i < TopExpr->Num(); i++)
 		{
+			if (IMP_QueueExecReference(TopExpr->Get(i), Ctx, CurrentExecPin))
+			{
+				continue;
+			}
 			UEdGraphPin* OutPin = nullptr;
 			UEdGraphNode* NewNode = IMP_ConvertFormToNodeStable(TopExpr->Get(i), Ctx, OutPin);
 			if (CurrentExecPin && NewNode)
 			{
-				UEdGraphPin* InExec = IMP_GetExecInput(NewNode);
+				UEdGraphPin* InExec = IMP_GetExecInput(NewNode, &Ctx);
 				if (InExec) IMP_Connect(CurrentExecPin, InExec, Ctx);
 			}
 			IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
@@ -11005,6 +13341,10 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		if (bReuseExistingFunctionBody)
 		{
 			IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+		}
+		if (!IMP_ResolvePendingExecReferences(Ctx))
+		{
+			return IMP_FailFromContext(Ctx, TEXT("ImportGraph function execution references failed"));
 		}
 
 
@@ -11058,7 +13398,7 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		Ctx.Graph     = Graph;
 		Ctx.ImportMode = Options.ImportMode;
 
-		IMP_ApplyRequestedStableId(ExistingTunnel, TopExpr, true);
+		IMP_ApplyRequestedStableId(ExistingTunnel, TopExpr, true, true);
 		FString EntryGuid = ExistingTunnel->NodeGuid.ToString();
 
 		Ctx.TempIdToNode.Add(EntryGuid, ExistingTunnel);
@@ -11087,11 +13427,15 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 
 		for (int32 i = BodyStart; i < TopExpr->Num(); i++)
 		{
+			if (IMP_QueueExecReference(TopExpr->Get(i), Ctx, CurrentExecPin))
+			{
+				continue;
+			}
 			UEdGraphPin* OutPin = nullptr;
 			UEdGraphNode* NewNode = IMP_ConvertFormToNodeStable(TopExpr->Get(i), Ctx, OutPin);
 			if (CurrentExecPin && NewNode)
 			{
-				UEdGraphPin* InExec = IMP_GetExecInput(NewNode);
+				UEdGraphPin* InExec = IMP_GetExecInput(NewNode, &Ctx);
 				if (InExec) IMP_Connect(CurrentExecPin, InExec, Ctx);
 			}
 			IMP_UpdateCurrentExecPin(NewNode, OutPin, CurrentExecPin);
@@ -11100,6 +13444,10 @@ FBlueprintLispResult FBlueprintLispConverter::ImportGraph(
 		if (bReuseExistingMacroBody)
 		{
 			IMP_FinalizeExistingEventBodyIncrementalReuse(Ctx);
+		}
+		if (!IMP_ResolvePendingExecReferences(Ctx))
+		{
+			return IMP_FailFromContext(Ctx, TEXT("ImportGraph macro execution references failed"));
 		}
 
 

@@ -266,6 +266,15 @@
         "被标记为“Expose on Spawn（生成时公开）”，但未被标记为“Instance Editable（实例可编辑）”",
         "marked as 'Expose on Spawn' but not marked as 'Instance Editable'"
       ]
+    },
+    {
+      "id": "timeline_semantics_validate",
+      "script_path": "timeline_semantics_validate_probe.py",
+      "result_path": "timeline_semantics_validate_probe_result.json",
+      "expected_success": true,
+      "target": "asset-independent DSL validation",
+      "issue": "Timeline 需要独立表达模板、异步回调、六种控制入口和数据输出，且顶层 timeline form 必须进入 Validate 白名单。",
+      "notes": "不读取或写入任何 Blueprint 资产；校验四种内部轨道、模板 flags、回调、timeline-control、timeline-output 的完整 S-expression，同时确认缺失右括号与未知顶层 form 会被拒绝。"
     }
   ]
 }

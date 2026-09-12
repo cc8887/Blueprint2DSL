@@ -125,9 +125,14 @@ FString FLispNode::ToString(bool bPretty, int32 IndentLevel) const
 	case ELispNodeType::Symbol:  return StringValue;
 	case ELispNodeType::Keyword: return StringValue; // already includes ':'
 	case ELispNodeType::Number:
-		if (FMath::IsNearlyEqual(NumberValue, FMath::RoundToDouble(NumberValue)))
+		// Keep integer forms compact only when the double is exactly integral and
+		// safely representable as an int64.  Approximate comparisons and
+		// SanitizeFloat's six-digit formatting corrupt small curve values.
+		if (FMath::IsFinite(NumberValue)
+			&& FMath::Abs(NumberValue) <= 9007199254740991.0
+			&& NumberValue == FMath::RoundToDouble(NumberValue))
 			return FString::Printf(TEXT("%lld"), (long long)(int64)NumberValue);
-		return FString::SanitizeFloat(NumberValue);
+		return FString::Printf(TEXT("%.17g"), NumberValue);
 
 	case ELispNodeType::String:
 		{
@@ -150,7 +155,7 @@ FString FLispNode::ToString(bool bPretty, int32 IndentLevel) const
 					if (C.IsValid() && C->IsList() && C->Children.Num() > 2) { bMultiLine = true; break; }
 			}
 			FString FormName = GetFormName();
-			if (bPretty && (FormName == TEXT("event") || FormName == TEXT("func")
+			if (bPretty && (FormName == TEXT("event") || FormName == TEXT("timeline") || FormName == TEXT("func")
 				|| FormName == TEXT("macro") || FormName == TEXT("seq")
 				|| FormName == TEXT("branch") || FormName == TEXT("foreach")
 				|| FormName == TEXT("switch")))

@@ -19,8 +19,73 @@ BlueprintLisp 是一个 Editor-only Unreal Engine 插件，用 Lisp 风格的 S-
 - 顺序执行、分支、动态转换，以及 `int`、`string`、`enum` switch。
 - 成员变量读写、结构体创建/拆分/字段修改、数组创建/取值、`select`、纯函数表达式等。
 - 顶层 `var` 声明的创建，以及常用默认值、Instance Editable、Expose on Spawn 元数据。
+- Timeline 模板、控制入口、数据输出、回调，以及 Event / Float / Vector / Linear Color 四类轨道的双向转换。
 
 实际 Blueprint 节点类型很多，不能假定任意节点都能无损往返。请先在目标资产副本上导出、导入并重新导出，确认结构和编译结果符合预期。
+
+### Timeline 语义
+
+Timeline 同时包含共享状态、多个执行入口、异步回调和数据输出，不能表示为普通的线性调用。BlueprintLisp 因此使用三类互相引用的 form：
+
+- 顶层 `(timeline NAME ...)` 定义 Timeline 模板、轨道和回调；同一图中的 `NAME` 必须唯一。
+- `(timeline-control :timeline NAME :action ACTION ...)` 表示进入某个控制 Pin 的执行命令。`ACTION` 支持 `play`、`play-from-start`、`stop`、`reverse`、`reverse-from-end`、`set-new-time`；最后一种还必须提供 `:time` 表达式。Blueprint 的 NewTime 是共享输入，因此同一 Timeline 的多个 `set-new-time` form 必须使用相同表达式。
+- `(timeline-output :timeline NAME :out-pin PIN)` 是纯表达式，引用 Timeline 的数据输出 Pin，例如 Float / Vector / Linear Color 轨道值或 `Direction`。稳定 ID 导出时该表达式还会带 `:id`。
+
+下面是一个最小的内部 Float 曲线示例。`:update`、`:finished` 和重复的 `:event` 都是异步回调体，不是 `timeline-control` 后面的同步 continuation：
+
+```lisp
+(timeline
+  "Timeline_0"
+  :length 1
+  :length-mode timeline-length
+  :autoplay false
+  :loop false
+  :replicated false
+  :ignore-time-dilation false
+  :metadata ("Category" "Effects")
+  :track
+    (float
+      "WallDiss"
+      :external false
+      :expanded true
+      :curve-view-synchronized true
+      :curve
+        (rich-curve
+          :pre-extrap constant
+          :post-extrap constant
+          :key (key :time 0 :value 0 :interp linear :tangent auto :weight none)
+          :key (key :time 1 :value 1 :interp linear :tangent auto :weight none)))
+  :update
+    (PrintString
+      :instring "Timeline update"
+      :duration (timeline-output :timeline "Timeline_0" :out-pin "WallDiss"))
+  :finished
+    (PrintString :instring "Timeline finished")
+  :id "11223344")
+
+(event
+  PlayWallDissAnim
+  (timeline-control :timeline "Timeline_0" :action play-from-start))
+```
+
+模板字段包括：
+
+- `:length` 为 Timeline 长度；`:length-mode` 可为 `timeline-length` 或 `last-key-frame`。
+- `:autoplay`、`:loop`、`:replicated`、`:ignore-time-dilation` 对应 Timeline 模板 flags，值为 `true` / `false`。
+- 重复的 `:metadata (KEY VALUE)` 按顺序保留 Timeline 变量元数据，例如 `Category`、`Tooltip`。
+- `:update BODY`、`:finished BODY` 分别连接 Update 和 Finished；`:event (TRACK-NAME BODY)` 连接同名 Event 轨道的执行输出，可重复出现。
+- `:pos "X,Y"` 和 `:id` 与其他节点一样用于位置及稳定身份；导入器会先建立所有 Timeline 定义，再解析控制、输出和回调引用。
+
+每条轨道写为 `:track (TYPE NAME ... :curve CURVE)`，并按出现顺序保留显示顺序。`TYPE` 支持：
+
+- `event`：事件关键帧，内部曲线使用 `rich-curve`。
+- `float`：Float 输出，内部曲线使用 `rich-curve`。
+- `vector`：Vector 输出，内部曲线使用 `(vector-curve :x ... :y ... :z ...)`，每个通道都是 `rich-curve`。
+- `linear-color`：Linear Color 输出，内部曲线使用 `(linear-color-curve :r ... :g ... :b ... :a ...)`。该 form 也保留 `:adjust-hue`、`:adjust-saturation`、`:adjust-brightness`、`:adjust-brightness-curve`、`:adjust-vibrance`、`:adjust-min-alpha` 和 `:adjust-max-alpha`。
+
+内部 `rich-curve` 支持可选的 `:default`、`:pre-extrap`、`:post-extrap`，以及重复的 `:key`。关键帧必须有有限数值 `:time` 和 `:value`，并可保留 `:interp`、`:tangent`、`:weight`、`:arrive`、`:leave`、`:arrive-weight`、`:leave-weight`。插值支持 `linear` / `constant` / `cubic` / `none`，切线支持 `auto` / `user` / `break` / `none`，UE 5.3 及以上还支持 `smart-auto`；权重支持 `none` / `arrive` / `leave` / `both`；曲线前后外推支持 `cycle` / `cycle-with-offset` / `oscillate` / `linear` / `constant` / `none`。
+
+外部曲线轨道使用 `:external true :curve (asset "<实际 Curve 资源 Object Path>")`；路径必须能加载为与轨道匹配的 `UCurveFloat`、`UCurveVector` 或 `UCurveLinearColor`。轨道还可保留 Editor 状态 `:expanded` 和 `:curve-view-synchronized`。
 
 ### 语法检查与查询
 

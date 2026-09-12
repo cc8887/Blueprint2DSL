@@ -13,6 +13,8 @@
 - `villager_select_before_print.bplisp`：`repair_villager_select_symbol_test.py` 依赖的输入夹具
 - `workbench/`：Edge Move 相关的探索/诊断脚本
 
+`timeline_semantics_validate` 是资产无关的语法回归：它只调用 `validate_dsl`，不读取、创建或保存 Blueprint 资产。仍需提供一个能够加载 BlueprintLisp 插件的 `.uproject` 来启动 Editor 命令行。
+
 ## 运行方式
 
 先设置环境变量，再执行：
@@ -38,13 +40,13 @@ python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 $env:BLUEPRINTLISP_CASE_FILTER = "incremental_root_event_reuse,incremental_call_reuse,incremental_pure_call_reuse,incremental_pure_array_reuse,incremental_break_struct_reuse,incremental_generic_pure_enum_reuse,incremental_call_macro_reuse,incremental_set_branch_reuse,incremental_cast_reuse,incremental_switch_int_reuse,incremental_call_parent_reuse,incremental_input_action_reuse,incremental_input_key_reuse,incremental_component_bound_event_reuse,incremental_actor_bound_event_reuse,incremental_function_seq_reuse,incremental_macro_exit_generic_reuse"
 
 python .\Tests\Regression\run_blueprintlisp_regression_suite.py
+```
 
+单独运行 Timeline 语法回归：
 
-
-
-
-
-
+```powershell
+$env:BLUEPRINTLISP_CASE_FILTER = "timeline_semantics_validate"
+python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 ```
 
 
