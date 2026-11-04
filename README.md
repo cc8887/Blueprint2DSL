@@ -234,3 +234,23 @@ python .\Tests\Regression\run_blueprintlisp_regression_suite.py
 ```
 
 部分 manifest case 自带 `uproject` 配置并依赖特定样例资产；case 级配置优先于上述默认环境变量。运行前应把这些 case 的 `uproject` 改为自己的验证工程或移除该字段，或者通过 `BLUEPRINTLISP_CASE_FILTER` 仅选择已经适配当前工程的用例。
+
+## 语义保真扩展
+
+源码中的语义保真扩展（不代表已发布二进制的能力）：
+
+- 外部属性读取使用 `(get-member :owner "/Script/Engine.LightComponent" :name Intensity :object Target)`，保留目标对象及所属类；可嵌套，并与 `break-struct` 组合。
+- `class</Script/UMG.UserWidget>` 表示带基类约束的 class reference，区别于实例 object reference，也可用于 array/set/map 的元素和值类型。
+- 已执行调用的数据输出使用 `(node-output :node "12345678" :pin "OutHits")` 引用该调用的 `:id`。同名输出不会从其他调用中猜测；关闭可选稳定 ID 时仍保留数据依赖必需的 ID。
+- 无法表达的纯节点、缺少值的关键字、多余位置参数、未知成员、悬空输出引用和内嵌 impure 调用会返回错误。导入错误不代表通用资产回滚；调用方必须检查结果。
+- 最小复现和运行回归见 `BlueprintLisp.Semantic.*` 以及 [回归测试说明](Tests/Regression/README.md)。
+
+### Semantic fidelity extensions
+
+Source-only semantic fidelity extensions (not a claim about released binaries):
+
+- `(get-member :owner "/Script/Engine.LightComponent" :name Intensity :object Target)` retains the owning class and target object. Reads can nest and compose with `break-struct`.
+- `class</Script/UMG.UserWidget>` preserves the class-reference category and base constraint, including array/set/map element and value types.
+- `(node-output :node "12345678" :pin "OutHits")` references an already executed call's `:id`. Output names are never guessed across calls. IDs required by data dependencies remain even when optional stable IDs are disabled.
+- Unsupported pure nodes, missing keyword values, excess positional arguments, unknown members, dangling output references, and nested impure calls return errors. A failed import does not imply general asset rollback; callers must check the result.
+- Minimal reproductions and runtime checks are under `BlueprintLisp.Semantic.*`; see the [regression guide](Tests/Regression/README.md).

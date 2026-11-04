@@ -1,5 +1,21 @@
 # BlueprintLisp Regression Tests
 
+## 资产无关的语义保真回归（UE 5.8）
+
+`Source/BlueprintLisp/Private/Tests/BlueprintLispSemanticTests.cpp` 从原生 K2 节点构造最小源图，再导出、导入到全新 Blueprint、编译并执行。覆盖外部对象及结构体拆分读取、class 参数和容器、同名调用的多输出归属、纯节点多输出共享以及静默损失拒绝。测试不依赖 WUCHANG 语料或生产资产。
+
+先在宿主工程编译插件，再运行：
+
+```powershell
+python .\Tests\Regression\run_semantic_regression.py `
+  --editor "<UnrealEditor-Cmd.exe>" --project "<Host.uproject>" `
+  --output "<一个新的结果目录>"
+```
+
+`--filter BlueprintLisp` 可运行整个 BlueprintLisp Automation 测试集。`--save-fixtures` 会把测试资产保存到宿主的 `/Game/BlueprintLispTests/Round1/<本次唯一编号>/`，路径记录在结果目录的 `fixtures.json`；随后设置 `BLUEPRINTLISP_FIXTURE_MANIFEST` 为该文件绝对路径，通过新 Editor 进程运行 `verify_semantic_reload.py`，验证磁盘重载后的类型和行为。可用 `BLUEPRINTLISP_RELOAD_RESULT` 指定重载报告路径。输出目录保留 Automation 报告、Editor 日志与 JSON 摘要。宿主插件若在退出阶段阻塞，运行器只会在完整测试报告落盘后终止自己启动的进程，并在摘要中单独记录。
+
+这些测试证明对应夹具的编译和运行行为，不证明完整游戏逻辑、所有 K2 节点或所有引擎版本的兼容性。
+
 这组文件是从本地验证脚本整理出的可分享测试分支版本，做过两类处理：
 
 1. 去掉了本机用户名与本地绝对路径；输出文件默认落在脚本所在目录。
