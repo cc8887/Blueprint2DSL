@@ -16,6 +16,12 @@ python .\Tests\Regression\run_semantic_regression.py `
 
 这些测试证明对应夹具的编译和运行行为，不证明完整游戏逻辑、所有 K2 节点或所有引擎版本的兼容性。
 
+第二轮数据访问回归位于 `BlueprintLispDataAccessTests.cpp`，可用同一运行器加 `--filter BlueprintLisp.DataAccess` 执行。覆盖 Map 的 Found/Value 显式绑定、关键字顺序、结构体值、零值与缺键、覆盖写入，以及 GetDataTableRow 的固定/动态表、拆分字段、found/not-found 分支、切换表、未消费 OutRow 和错误拒绝。ReplaceGraph 与 MergeAppend 均有运行断言。
+
+加 `--save-fixtures` 后，第二轮资产保存在 `/Game/BlueprintLispTests/Round2/<本次唯一编号>/`，同样记录于 `fixtures.json`。使用新 Editor 进程运行 `verify_data_access_reload.py`，并设置 `BLUEPRINTLISP_FIXTURE_MANIFEST` 与可选的 `BLUEPRINTLISP_RELOAD_RESULT`，验证原 Map 的变更以及数据表重载后的行内容和两个执行出口。完整 `--filter BlueprintLisp` 同时覆盖两轮测试；对应的两个重载脚本分别检查自己的夹具。
+
+保存图迁移、旧数组字面量、引用参数和执行链缺失的最小复现，以及 UE 5.8+ 维护 API 的使用边界，见 [Maintenance.md](Maintenance.md)。
+
 这组文件是从本地验证脚本整理出的可分享测试分支版本，做过两类处理：
 
 1. 去掉了本机用户名与本地绝对路径；输出文件默认落在脚本所在目录。

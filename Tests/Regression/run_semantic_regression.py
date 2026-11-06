@@ -36,6 +36,9 @@ def main():
         command.append("-BlueprintLispSemanticFixtureRun=" + fixture_run)
         fixtures = {name: "/Game/BlueprintLispTests/Round1/" + fixture_run + "/" + name
                     for name in ["BP_BL_External", "BP_BL_Class", "BP_BL_Outputs"]}
+        fixtures.update({name: "/Game/BlueprintLispTests/Round2/" + fixture_run + "/" + name
+                         for name in ["BP_BL_Map", "BP_BL_MapStruct", "DT_BL_Rows", "BP_BL_DataTable",
+                                      "BP_BL_DataTableDynamic", "BP_BL_DataTableGate"]})
         (output / "fixtures.json").write_text(json.dumps(fixtures, indent=2), encoding="utf-8")
     start = time.monotonic()
     completed_at = None

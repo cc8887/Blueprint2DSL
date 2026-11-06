@@ -254,3 +254,27 @@ Source-only semantic fidelity extensions (not a claim about released binaries):
 - `(node-output :node "12345678" :pin "OutHits")` references an already executed call's `:id`. Output names are never guessed across calls. IDs required by data dependencies remain even when optional stable IDs are disabled.
 - Unsupported pure nodes, missing keyword values, excess positional arguments, unknown members, dangling output references, and nested impure calls return errors. A failed import does not imply general asset rollback; callers must check the result.
 - Minimal reproductions and runtime checks are under `BlueprintLisp.Semantic.*`; see the [regression guide](Tests/Regression/README.md).
+
+## Map 与 DataTable 数据访问
+
+Map 调用继续使用普通函数语法：`Map_Add` 的 `:TargetMap` 会先建立键/值类型，因此关键字顺序不会清空先前的字面量键。`Map_Find` 可用 `:out-pin "ReturnValue"` 读取 Found，用 `:out-pin "Value"` 读取值，两者也可分别绑定到 `let`；存在且值为零与缺少键是不同结果。
+
+数据表行使用独立执行形态，并保留两个出口与同一次查行的 OutRow：
+
+~~~lisp
+(get-data-table-row
+  :table (asset "/Game/Data/DT_Items.DT_Items")
+  :row RowName
+  :row-struct "/Script/MyGame.ItemRow"
+  :id "1badc0de"
+  :found (ConsumeRow :Row (node-output :node "1badc0de" :pin "ReturnValue"))
+  :not-found (HandleMissingRow))
+~~~
+
+示例中的资产、行类型和处理函数由调用工程提供。动态 `:table` 表达式必须声明 `:row-struct`；固定表资产可推断行类型，显式声明时须与资产一致。OutRow 可与 `break-struct` 组合读取字段。后续执行放在 `:found` / `:not-found` 内。缺表、类型不符或无效输出引用会返回错误。`BlueprintLisp.DataAccess.*` 覆盖 Map 与数据表的运行回归。
+
+### Map and DataTable access
+
+Map calls retain ordinary function syntax. `Map_Add` establishes `:TargetMap` key/value types before assigning other arguments, preserving literal keys regardless of keyword order. `Map_Find` exposes Found as `:out-pin "ReturnValue"` and the value as `:out-pin "Value"`; explicit `let` bindings honor that selection. A present zero value remains distinct from a missing key.
+
+`get-data-table-row` retains `:table`, `:row`, `:row-struct`, `:found`, `:not-found`, and `:id`. Branches reference that lookup's row using `(node-output :node "1badc0de" :pin "ReturnValue")`, optionally composed with `break-struct`. Dynamic table expressions require `:row-struct`; a fixed table can infer it, and an explicit type must match the asset. Continuations belong inside the two branch bodies. Missing tables, incompatible types, and invalid output references fail explicitly. Runtime coverage is under `BlueprintLisp.DataAccess.*`.

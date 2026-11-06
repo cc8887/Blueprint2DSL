@@ -356,7 +356,7 @@ FLispNodePtr FLispParser::ParseSymbolOrKeyword()
 	auto IsSymChar = [](TCHAR c) {
 		return FChar::IsAlnum(c) || c=='_'||c=='-'||c=='+'||c=='*'||
 			   c=='/'||c=='?'||c=='!'||c=='<'||c=='>'||c=='='||
-			   c=='.'||c=='@'||c=='&';
+			   c=='.'||c=='@'||c=='&'||c==',';
 	};
 	while (!IsAtEnd() && IsSymChar(Peek())) Name += Advance();
 	if (Name.IsEmpty() || (bKW && Name.Len() == 1)) return nullptr;
